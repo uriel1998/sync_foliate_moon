@@ -57,6 +57,22 @@ COMPACT_MOON_RE = re.compile(
 TITLE_AUTHOR_RE = re.compile(r"^(?P<title>.+?) - (?P<author>.+)$")
 
 
+def script_root() -> Path:
+    """Return the canonical directory containing this script.
+
+    `resolve()` follows symlinks, so this stays correct when the script is
+    launched through a symlink or from a different working directory.
+    """
+
+    return Path(__file__).resolve().parent
+
+
+def script_path() -> Path:
+    """Return the canonical path to this script."""
+
+    return Path(__file__).resolve()
+
+
 @dataclass
 class MoonState:
     """Normalized Moon+ state parsed from one `.po` file.
@@ -154,7 +170,8 @@ def ensure_venv() -> None:
 
     # `root` anchors all repo-local files, regardless of the directory from
     # which the user launched the script.
-    root = Path(__file__).resolve().parent
+    root = script_root()
+    script = script_path()
     venv_dir = root / ".venv"
     in_venv = sys.prefix != getattr(sys, "base_prefix", sys.prefix)
 
@@ -172,7 +189,7 @@ def ensure_venv() -> None:
         env = os.environ.copy()
         env["SYNC_EBOOK_BOOTSTRAPPED"] = "1"
         subprocess.check_call(
-            [str(python_path), str(Path(__file__).resolve()), *sys.argv[1:]],
+            [str(python_path), str(script), *sys.argv[1:]],
             env=env,
             cwd=str(Path.cwd()),
         )
@@ -225,7 +242,7 @@ def parse_args() -> argparse.Namespace:
 
 
 def load_env_directories(env_path: Path) -> dict[str, Path]:
-    """Read application directories from `.env` in the current working dir.
+    """Read application directories from the repository-local `.env`.
 
     Expected format:
         Moon:/path/to/moon/files
@@ -1016,14 +1033,14 @@ def main() -> int:
     Order matters here:
     1. bootstrap the environment
     2. parse CLI arguments
-    3. resolve directories from the caller's working directory
+    3. resolve directories from the repository-local `.env`
     4. perform sync
     """
 
     # Keep startup steps in the same order described by the project plan.
     ensure_venv()
     args = parse_args()
-    env_directories = load_env_directories(Path.cwd() / ".env")
+    env_directories = load_env_directories(script_root() / ".env")
     updates = sync_states(
         args,
         env_directories[APP_MOON],

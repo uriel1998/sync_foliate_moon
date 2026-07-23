@@ -83,7 +83,13 @@ This happens before parsing `.env` or touching any reading state files.
 
 ### 2. Read Configuration
 
-The script reads `.env` from the directory where it is launched.
+The script reads `.env` from the same real directory as `sync_reading_state.py`.
+
+That means it still finds the correct config when you:
+
+- run it from a different working directory
+- invoke it through a symlink
+- schedule it with cron
 
 Each non-empty, non-comment line must be:
 
