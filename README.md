@@ -18,6 +18,8 @@ Moon+ and Foliate both store useful reading progress information, but they do no
 
 That means "syncing progress" is straightforward, but "syncing exact position" is sometimes only approximate. This project tries to do the most reliable thing possible with the information available.
 
+Note:  While I use Calibre for library management, I have Foliate configured as my reader.
+
 ## Features
 
 - Creates and uses a local `.venv`
@@ -44,6 +46,9 @@ cp env.example .env
 Moon:/path/to/Moon+/
 Foliate:/path/to/com.github.johnfactotum.Foliate/
 ```
+
+I am using Moon+'s cloud sync with NextCloud, and then NextCloud's app to sync with my desktop.
+If you installed Foliate via Flatpak, look in `$HOME/.var/app/com.github.johnfactotum.Foliate/data/com.github.johnfactotum.Foliate/` 
 
 3. Run the sync:
 
