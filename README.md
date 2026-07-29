@@ -305,3 +305,14 @@ The script skips:
 ## License
 
 This project is licensed under [`0BSD`](./LICENSE).
+
+
+## AI Usage
+
+![button_extensive-ai-use](https://i.imgur.com/aYq2HvX.png)
+
+The code in this repository has been significantly written or altered by an AI tool with human supervision.  The instructions to the AI agents were detailed, step-by-step pseudocode with very specific limitations.  Whenever possible, the code is also explicitly and extensively commented so that it may be audited to determine that it does what it says it does.  Again, while the code in this repository works for me and I am using it, it should be considered a proof-of-concept for others to refine, fix, and build upon.  
+
+You are encouraged to fork and refine or rebuild this program or create something better that has the same functionality.
+
+This is what most people would call "vibe coded". 
