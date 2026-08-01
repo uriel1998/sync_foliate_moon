@@ -1,20 +1,22 @@
 # Syncing Ebook
 
-Bidirectional reading-state sync between Moon+ Reader and Foliate.
+Reading-state sync across Moon+ Reader, Foliate, and EPW.
 
 This project synchronizes reading state between:
 
 - Moon+ sidecar files such as `Title - Author.epub.po`
 - Foliate JSON state files such as `9780765389206.json`
+- EPW SQLite state rows in `states.db`
 
 The script is designed as a practical compatibility tool. It does **not** claim lossless conversion between the two readers, because the two applications store fundamentally different notions of "position in a book."
 
 ## Why This Exists
 
-Moon+ and Foliate both store useful reading progress information, but they do not store it in the same shape:
+Moon+, Foliate, and EPW all store useful reading progress information, but they do not store it in the same shape:
 
 - Foliate stores structured JSON and usually an EPUB CFI in `lastLocation`
 - Moon+ stores a proprietary compact locator or a looser key/value state dump
+- EPW stores a content index plus rendered-row state in SQLite
 
 That means "syncing progress" is straightforward, but "syncing exact position" is sometimes only approximate. This project tries to do the most reliable thing possible with the information available.
 
@@ -24,12 +26,14 @@ Note:  While I use Calibre for library management, I have Foliate configured as 
 
 - Creates and uses a local `.venv`
 - Installs dependencies from `requirements.txt`
-- Reads Moon+ and Foliate directories from `.env`
+- Reads Moon+, Foliate, and optional EPW locations from `.env`
 - Matches books by normalized `title + author`
-- Supports conflict resolution with `--position`, `--date`, `--moon`, and `--foliate`
+- Supports conflict resolution with `--position`, `--date`, `--moon`, `--foliate`, and `--epw`
 - Updates Foliate progress and approximate reopen position
 - Updates Moon+ key/value states directly
+- Updates EPW SQLite reading state directly
 - Attempts approximate Foliate -> Moon+ compact sync using the actual EPUB spine
+- Bootstraps missing Foliate/EPW entries when one side already knows the book filepath
 - Prints visible warnings when a reverse approximation cannot be performed safely
 
 ## Quick Start
@@ -45,6 +49,7 @@ cp env.example .env
 ```text
 Moon:/path/to/Moon+/
 Foliate:/path/to/com.github.johnfactotum.Foliate/
+EPW:/path/to/epw/or/states.db
 ```
 
 I am using Moon+'s cloud sync with NextCloud, and then NextCloud's app to sync with my desktop.
@@ -63,6 +68,7 @@ If you installed Foliate via Flatpak, look in `$HOME/.var/app/com.github.johnfac
 ./sync_reading_state.py --date
 ./sync_reading_state.py --moon
 ./sync_reading_state.py --foliate
+./sync_reading_state.py --epw
 ./sync_reading_state.py --help
 ```
 
@@ -101,6 +107,7 @@ Currently supported applications:
 
 - `Moon`
 - `Foliate`
+- `EPW`
 
 Unknown application names are ignored.
 
@@ -164,7 +171,11 @@ Normalization intentionally ignores formatting details:
 
 This is a lossy comparison by design. The goal is resilience across metadata sources, not preservation of display formatting.
 
-Only books present on **both** sides are considered for sync.
+Moon+ still matches by normalized title/author.
+
+Foliate and EPW can also bootstrap one-sided entries when one side already
+knows the real book filepath. That lets them sync even if the book has not yet
+been opened in the other application.
 
 ### 6. Choose a Winner
 
@@ -189,6 +200,10 @@ Moon+ always wins.
 #### `--foliate`
 
 Foliate always wins.
+
+#### `--epw`
+
+EPW always wins.
 
 ### 7. Write The Loser
 
@@ -234,6 +249,25 @@ Instead, the script attempts a section-level approximation:
 
 The resulting compact state is intentionally boundary-based. It resets page and offset to the start of the chosen section rather than inventing paragraph-accurate numbers.
 
+### Foliate <-> EPW
+
+When Foliate and EPW both know the same book filepath, the script can sync them
+even if one side did not previously have a saved reading-state entry.
+
+Foliate -> EPW:
+
+- creates or updates an EPW `reading_states` row keyed by exact filepath
+- updates the EPW `library` row for title, author, and progress
+- approximates EPW `content_index` from Foliate's current CFI or overall progress
+- uses a conservative boundary location with `row = 0` and `rel_pctg = 0.0`
+
+EPW -> Foliate:
+
+- creates or updates a Foliate JSON state file and `library/uri-store.json` entry
+- uses EPUB metadata identifier when available
+- otherwise uses Foliate's own fallback identifier shape: `foliate:` + MD5(first 10,000,000 bytes)
+- approximates `lastLocation` from EPW's `content_index`
+
 ## Assumptions
 
 The script makes several explicit assumptions.
@@ -244,6 +278,7 @@ The script makes several explicit assumptions.
 - Moon+ filenames use the `Title - Author` convention
 - Foliate metadata titles/authors refer to the same edition or a compatible edition
 - joining multiple Foliate authors with ` & ` is acceptable for matching against Moon+ filenames
+- EPW library title/author are good enough for cross-app matching
 
 ### Timestamp Assumptions
 
@@ -256,12 +291,14 @@ The script makes several explicit assumptions.
 - Moon+ chapter values are section-like enough to map to EPUB spine items
 - a start-of-spine-item CFI is a safer approximation than fabricating a precise paragraph offset
 - a start-of-spine-item Moon+ compact locator is safer than fabricating page/offset detail
+- an EPW boundary position at `row = 0` is safer than inventing a rendered-line offset
 
 ### Environment Assumptions
 
 - Foliate's `library/uri-store.json` exists when reverse approximation needs EPUB access
 - the URI store points at an actually accessible local EPUB file
 - the EPUB is well-formed enough to expose a valid OPF and spine
+- EPW is closed while the script edits `states.db`, so a later in-process save does not overwrite external changes
 
 ## Caveats
 
@@ -283,9 +320,11 @@ Foliate -> Moon+ compact sync is section-level only. It does not reconstruct Moo
 
 If the actual EPUB file cannot be resolved through Foliate's URI store, the script cannot perform compact reverse approximation safely. In that case it prints a warning and leaves the Moon+ compact file unchanged.
 
-### One-Sided Books Are Skipped
+### Some One-Sided Books Are Still Skipped
 
-Books present in only one application are ignored for now.
+Moon+ entries present only on one side are still ignored.
+
+Foliate and EPW can create missing counterpart entries when filepath information is available, but Moon+ does not expose a comparable stable filepath-based identity.
 
 ### Unparseable Entries Are Skipped
 

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Bidirectionally sync reading position between Moon+ and Foliate.
+"""Sync reading position across Moon+, Foliate, and EPW.
 
 This module is deliberately written as a "practical translator" between two
 reader applications that store reading state in different formats:
@@ -9,11 +9,14 @@ reader applications that store reading state in different formats:
   key/value document.
 - Foliate stores state in JSON files whose metadata includes title, author,
   progress, and usually an EPUB CFI in `lastLocation`.
+- EPW stores state in a SQLite database whose rows record filepath, content
+  index, rendered row, and library/display progress.
 
-The core challenge is that Moon+ and Foliate do *not* expose equivalent
-location models. Moon+ uses a proprietary chapter/page/offset encoding, while
-Foliate uses standard EPUB CFI. Exact conversion between those models is not
-available from the reference material in this repository.
+The core challenge is that these readers do *not* expose equivalent location
+models. Moon+ uses a proprietary chapter/page/offset encoding, Foliate uses
+standard EPUB CFI, and EPW stores content index plus rendered-line offsets.
+Exact conversion between those models is not available from the reference
+material in this repository.
 
 The script therefore follows a conservative strategy:
 
@@ -32,9 +35,11 @@ from __future__ import annotations
 
 import argparse
 from datetime import datetime, timezone
+import hashlib
 import json
 import os
 import re
+import sqlite3
 import subprocess
 import sys
 import time
@@ -48,7 +53,9 @@ from zipfile import ZipFile
 
 APP_MOON = "Moon"
 APP_FOLIATE = "Foliate"
-SUPPORTED_APPS = {APP_MOON, APP_FOLIATE}
+APP_EPW = "EPW"
+SUPPORTED_APPS = {APP_MOON, APP_FOLIATE, APP_EPW}
+REQUIRED_APPS = {APP_MOON, APP_FOLIATE}
 COMPACT_MOON_RE = re.compile(
     r"^(?P<timestamp>\d+)\*(?P<chapter>\d+)"
     r"(?:@(?P<page>\d+))?(?:#(?P<offset>\d+))?:"
@@ -139,12 +146,26 @@ class FoliateState:
 
 
 @dataclass
-class MoonSyncResult:
-    """Result of attempting to update a Moon+ state file.
+class EPWState:
+    """Normalized EPW state parsed from one SQLite row pair."""
 
-    Updating Moon+ from Foliate can fail for understandable reasons, especially
-    for compact Moon+ files that need the actual EPUB to do a section-level
-    approximation. Returning a structured result lets the caller distinguish:
+    db_path: Path
+    filepath: str
+    title: str
+    author: str
+    modified_time: float
+    percent: float | None
+    content_index: int
+    textwidth: int
+    row: int
+    rel_pctg: float | None
+
+
+@dataclass
+class UpdateResult:
+    """Result of attempting to update one app's stored state.
+
+    Returning a structured result lets the caller distinguish:
 
     - "the file changed"
     - "the file stayed the same"
@@ -215,7 +236,7 @@ def parse_args() -> argparse.Namespace:
     # These options are mutually exclusive because a single run should use
     # exactly one rule for choosing the source of truth.
     parser = argparse.ArgumentParser(
-        description="Sync reading position between Moon+ Reader and Foliate."
+        description="Sync reading position across Moon+ Reader, Foliate, and EPW."
     )
     group = parser.add_mutually_exclusive_group()
     group.add_argument(
@@ -237,6 +258,11 @@ def parse_args() -> argparse.Namespace:
         "--foliate",
         action="store_true",
         help="Always prefer the Foliate state.",
+    )
+    group.add_argument(
+        "--epw",
+        action="store_true",
+        help="Always prefer the EPW state.",
     )
     return parser.parse_args()
 
@@ -272,7 +298,7 @@ def load_env_directories(env_path: Path) -> dict[str, Path]:
             continue
         directories[app] = Path(directory.strip()).expanduser()
 
-    missing = SUPPORTED_APPS - directories.keys()
+    missing = REQUIRED_APPS - directories.keys()
     if missing:
         raise ValueError(f"Missing application directories in .env: {sorted(missing)}")
     return directories
@@ -516,6 +542,17 @@ def parse_iso8601_timestamp(value: Any) -> float | None:
         return None
 
 
+def parse_epw_timestamp(value: Any) -> float | None:
+    """Parse EPW's SQLite timestamp format into Unix seconds."""
+
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        return datetime.fromisoformat(value).timestamp()
+    except ValueError:
+        return None
+
+
 def payload_string(value: Any) -> str | None:
     """Return a non-empty string payload value when present.
 
@@ -561,6 +598,136 @@ def normalize_foliate_author(value: Any) -> str:
     return ""
 
 
+def canonical_locator(value: str | Path) -> str:
+    """Return a stable comparable locator for local paths or URIs."""
+
+    text = str(value)
+    if text.startswith("file://"):
+        return Path(text.removeprefix("file://")).expanduser().resolve(strict=False).as_posix()
+    if "://" in text:
+        return text
+    return Path(text).expanduser().resolve(strict=False).as_posix()
+
+
+def epw_local_book_path(filepath: str) -> Path | None:
+    """Return a local book path for an EPW filepath when one exists."""
+
+    if "://" in filepath:
+        return None
+    return Path(filepath).expanduser()
+
+
+def resolve_epw_db_path(path: Path) -> Path:
+    """Resolve an EPW config entry to a concrete SQLite database path."""
+
+    expanded = path.expanduser()
+    return expanded / "states.db" if expanded.is_dir() else expanded
+
+
+def init_epw_db(db_path: Path) -> None:
+    """Create an EPW-compatible SQLite database when it is missing."""
+
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS reading_states (
+                filepath TEXT PRIMARY KEY,
+                content_index INTEGER,
+                textwidth INTEGER,
+                row INTEGER,
+                rel_pctg REAL
+            );
+
+            CREATE TABLE IF NOT EXISTS library (
+                last_read DATETIME DEFAULT (datetime('now','localtime')),
+                filepath TEXT PRIMARY KEY,
+                title TEXT,
+                author TEXT,
+                reading_progress REAL,
+                FOREIGN KEY (filepath) REFERENCES reading_states(filepath)
+                ON DELETE CASCADE
+            );
+
+            CREATE TABLE IF NOT EXISTS bookmarks (
+                id TEXT PRIMARY KEY,
+                filepath TEXT,
+                name TEXT,
+                content_index INTEGER,
+                textwidth INTEGER,
+                row INTEGER,
+                rel_pctg REAL,
+                FOREIGN KEY (filepath) REFERENCES reading_states(filepath)
+                ON DELETE CASCADE
+            );
+            """
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def load_foliate_uri_store(foliate_dir: Path) -> dict[str, str]:
+    """Load Foliate's identifier -> URI/path store."""
+
+    uri_store = foliate_dir / "library" / "uri-store.json"
+    if not uri_store.exists():
+        return {}
+    try:
+        payload = json.loads(uri_store.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+    uris = payload.get("uris")
+    if not isinstance(uris, list):
+        return {}
+
+    result: dict[str, str] = {}
+    for entry in uris:
+        if (
+            isinstance(entry, list)
+            and len(entry) == 2
+            and isinstance(entry[0], str)
+            and isinstance(entry[1], str)
+        ):
+            result[entry[0]] = entry[1]
+    return result
+
+
+def save_foliate_uri_store(foliate_dir: Path, mapping: dict[str, str]) -> None:
+    """Persist Foliate's identifier -> URI/path store."""
+
+    uri_store = foliate_dir / "library" / "uri-store.json"
+    uri_store.parent.mkdir(parents=True, exist_ok=True)
+    payload = {"uris": [[key, value] for key, value in mapping.items()]}
+    uri_store.write_text(
+        json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
+        encoding="utf-8",
+    )
+
+
+def foliate_store_value_for_path(book_path: Path) -> str:
+    """Format a local path the way Foliate stores it in `uri-store.json`."""
+
+    home_dir = str(Path.home())
+    resolved = str(book_path.expanduser())
+    return resolved.replace(home_dir, "~", 1) if resolved.startswith(home_dir) else f"file://{resolved}"
+
+
+def get_foliate_book_locator(foliate: FoliateState) -> str | None:
+    """Resolve the raw locator string from Foliate's URI store."""
+
+    if not foliate.identifier:
+        return None
+
+    uri_store = load_foliate_uri_store(foliate.path.parent)
+    locator = uri_store.get(foliate.identifier)
+    if not locator:
+        return None
+    return locator.replace("~", str(Path.home()), 1) if locator.startswith("~") else locator
+
+
 def resolve_foliate_book_path(foliate: FoliateState) -> Path | None:
     """Resolve the underlying book path from Foliate's local URI store.
 
@@ -569,33 +736,11 @@ def resolve_foliate_book_path(foliate: FoliateState) -> Path | None:
     we need the actual EPUB package to inspect its spine.
     """
 
-    if not foliate.identifier:
+    locator = get_foliate_book_locator(foliate)
+    if not locator or "://" in locator:
         return None
-
-    uri_store = foliate.path.parent / "library" / "uri-store.json"
-    if not uri_store.exists():
-        return None
-
-    try:
-        payload = json.loads(uri_store.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return None
-
-    uris = payload.get("uris")
-    if not isinstance(uris, list):
-        return None
-
-    # The URI store uses two-element arrays: `[identifier, path]`.
-    for entry in uris:
-        if (
-            isinstance(entry, list)
-            and len(entry) == 2
-            and entry[0] == foliate.identifier
-            and isinstance(entry[1], str)
-        ):
-            candidate = Path(entry[1]).expanduser()
-            return candidate if candidate.exists() else None
-    return None
+    candidate = Path(locator).expanduser()
+    return candidate if candidate.exists() else None
 
 
 def read_epub_spine_items(book_path: Path) -> list[str] | None:
@@ -658,6 +803,52 @@ def read_epub_spine_length(book_path: Path) -> int | None:
 
     items = read_epub_spine_items(book_path)
     return len(items) if items else None
+
+
+def read_epub_metadata(book_path: Path) -> dict[str, str]:
+    """Read a small subset of EPUB metadata needed for external sync."""
+
+    try:
+        with ZipFile(book_path) as archive:
+            opf_path, _ = read_epub_package(archive)
+            opf = ET.fromstring(archive.read(opf_path))
+    except (KeyError, OSError, ET.ParseError):
+        return {}
+
+    ns = {
+        "opf": "http://www.idpf.org/2007/opf",
+        "dc": "http://purl.org/dc/elements/1.1/",
+    }
+
+    def first_text(pattern: str) -> str | None:
+        for element in opf.findall(pattern, ns):
+            if element.text and element.text.strip():
+                return element.text.strip()
+        return None
+
+    creators = [
+        element.text.strip()
+        for element in opf.findall(".//opf:metadata/dc:creator", ns)
+        if element.text and element.text.strip()
+    ]
+    metadata: dict[str, str] = {}
+    identifier = first_text(".//opf:metadata/dc:identifier")
+    title = first_text(".//opf:metadata/dc:title")
+    if identifier:
+        metadata["identifier"] = identifier
+    if title:
+        metadata["title"] = title
+    if creators:
+        metadata["author"] = " & ".join(creators)
+    return metadata
+
+
+def make_foliate_fallback_identifier(book_path: Path) -> str:
+    """Match Foliate's fallback identifier generation for local files."""
+
+    with book_path.open("rb") as handle:
+        digest = hashlib.md5(handle.read(10_000_000)).hexdigest()
+    return f"foliate:{digest}"
 
 
 def choose_spine_index(moon: MoonState, spine_length: int) -> int | None:
@@ -762,6 +953,16 @@ def moon_compact_from_spine_boundary(
     return f"{timestamp_ms}*{spine_index}@0#0:{foliate.percent:.1f}%"
 
 
+def moon_compact_from_epw(moon: MoonState, epw: EPWState) -> str | None:
+    """Approximate a compact Moon+ locator from EPW's content index."""
+
+    if epw.percent is None:
+        return None
+    timestamp_ms = int(time.time() * 1000)
+    chapter = max(1, epw.content_index + 1)
+    return f"{timestamp_ms}*{chapter}@0#0:{epw.percent:.1f}%"
+
+
 def synthesize_foliate_location(foliate: FoliateState, moon: MoonState) -> str | None:
     """Build an approximate Foliate location from Moon+ state.
 
@@ -786,6 +987,62 @@ def synthesize_foliate_location(foliate: FoliateState, moon: MoonState) -> str |
     return build_spine_item_start_cfi(book_path, spine_index) or payload_string(
         foliate.payload.get("lastLocation")
     )
+
+
+def synthesize_foliate_location_from_epw(foliate: FoliateState, epw: EPWState) -> str | None:
+    """Build an approximate Foliate location from EPW state."""
+
+    book_path = resolve_foliate_book_path(foliate)
+    if not book_path:
+        return payload_string(foliate.payload.get("lastLocation"))
+
+    spine_length = read_epub_spine_length(book_path)
+    if spine_length is None or spine_length <= 0:
+        return payload_string(foliate.payload.get("lastLocation"))
+
+    spine_index = max(1, min(spine_length, epw.content_index + 1))
+    return build_spine_item_start_cfi(book_path, spine_index) or payload_string(
+        foliate.payload.get("lastLocation")
+    )
+
+
+def choose_epw_content_index_from_moon(moon: MoonState, filepath: str) -> int | None:
+    """Choose a zero-based EPW content index from Moon+ state."""
+
+    if moon.chapter is not None and moon.chapter > 0:
+        return moon.chapter - 1
+
+    book_path = epw_local_book_path(filepath)
+    if not book_path or not book_path.exists():
+        return None
+
+    spine_length = read_epub_spine_length(book_path)
+    if spine_length is None or spine_length <= 0:
+        return None
+
+    spine_index = choose_spine_index(moon, spine_length)
+    return None if spine_index is None else spine_index - 1
+
+
+def choose_epw_content_index_from_foliate(foliate: FoliateState, filepath: str) -> int | None:
+    """Choose a zero-based EPW content index from Foliate state."""
+
+    last_location = payload_string(foliate.payload.get("lastLocation"))
+    if last_location:
+        spine_index = parse_foliate_spine_index(last_location)
+        if spine_index is not None:
+            return max(0, spine_index - 1)
+
+    book_path = epw_local_book_path(filepath)
+    if not book_path or not book_path.exists():
+        return None
+
+    spine_length = read_epub_spine_length(book_path)
+    if spine_length is None or spine_length <= 0 or foliate.percent is None:
+        return None
+
+    derived = round((foliate.percent / 100) * spine_length)
+    return max(0, min(spine_length - 1, derived - 1))
 
 
 def load_moon_states(directory: Path) -> dict[tuple[str, str], MoonState]:
@@ -823,37 +1080,118 @@ def load_foliate_states(directory: Path) -> dict[tuple[str, str], FoliateState]:
     return states
 
 
-def choose_winner(
-    args: argparse.Namespace, moon: MoonState, foliate: FoliateState
-) -> str | None:
-    """Choose which application's state wins for a matched book.
+def build_foliate_filepath_map(states: dict[tuple[str, str], FoliateState]) -> dict[str, FoliateState]:
+    """Index Foliate states by the canonical locator of their backing book."""
 
-    Rules:
-    - `--moon` and `--foliate` are absolute overrides
-    - `--date` prefers the newer file modification timestamp
-    - default `--position` prefers the larger percentage progress
+    mapping: dict[str, FoliateState] = {}
+    for state in states.values():
+        locator = get_foliate_book_locator(state)
+        if locator:
+            mapping[canonical_locator(locator)] = state
+    return mapping
 
-    Returning `None` means the script does not have enough data to resolve the
-    conflict safely, so that title is skipped.
-    """
 
-    # Explicit override flags take precedence over all other heuristics.
-    if args.moon:
+def load_epw_states(
+    db_path: Path,
+) -> tuple[dict[tuple[str, str], EPWState], dict[str, EPWState]]:
+    """Load EPW rows and index them by title/author and filepath."""
+
+    db_path = resolve_epw_db_path(db_path)
+    if not db_path.exists():
+        return {}, {}
+
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    try:
+        rows = conn.execute(
+            """
+            SELECT
+                rs.filepath,
+                rs.content_index,
+                rs.textwidth,
+                rs.row,
+                rs.rel_pctg,
+                l.last_read,
+                l.title,
+                l.author,
+                l.reading_progress
+            FROM reading_states rs
+            LEFT JOIN library l ON l.filepath = rs.filepath
+            """
+        ).fetchall()
+    finally:
+        conn.close()
+
+    by_key: dict[tuple[str, str], EPWState] = {}
+    by_filepath: dict[str, EPWState] = {}
+    for row in rows:
+        filepath = row["filepath"]
+        if not isinstance(filepath, str):
+            continue
+
+        reading_progress = row["reading_progress"]
+        percent = None
+        if isinstance(reading_progress, (int, float)):
+            percent = float(reading_progress) * 100
+
+        modified_time = parse_epw_timestamp(row["last_read"])
+        if modified_time is None:
+            modified_time = db_path.stat().st_mtime
+
+        content_index = int(row["content_index"] or 0)
+        rel_pctg = float(row["rel_pctg"]) if isinstance(row["rel_pctg"], (int, float)) else None
+        state = EPWState(
+            db_path=db_path,
+            filepath=filepath,
+            title=row["title"] or "",
+            author=row["author"] or "",
+            modified_time=modified_time,
+            percent=percent,
+            content_index=content_index,
+            textwidth=int(row["textwidth"] or 80),
+            row=int(row["row"] or 0),
+            rel_pctg=rel_pctg,
+        )
+
+        if state.percent is None:
+            local_path = epw_local_book_path(filepath)
+            spine_length = read_epub_spine_length(local_path) if local_path and local_path.exists() else None
+            if spine_length and spine_length > 0:
+                intra = rel_pctg if rel_pctg is not None else 0.0
+                state.percent = ((content_index + intra) / spine_length) * 100
+
+        by_filepath[canonical_locator(filepath)] = state
+        if state.title and state.author:
+            by_key[(normalize_name(state.title), normalize_name(state.author))] = state
+
+    return by_key, by_filepath
+
+
+def choose_winner(args: argparse.Namespace, states: dict[str, Any]) -> str | None:
+    """Choose which application's state wins for a matched book."""
+
+    if args.moon and APP_MOON in states:
         return APP_MOON
-    if args.foliate:
+    if args.foliate and APP_FOLIATE in states:
         return APP_FOLIATE
-    if args.date:
-        if moon.modified_time == foliate.modified_time:
-            return APP_MOON if (moon.percent or -1) >= (foliate.percent or -1) else APP_FOLIATE
-        return APP_MOON if moon.modified_time > foliate.modified_time else APP_FOLIATE
+    if args.epw and APP_EPW in states:
+        return APP_EPW
 
-    # The default mode is progress-based, so a missing percentage makes the
-    # comparison unsafe.
-    if moon.percent is None or foliate.percent is None:
+    if args.date:
+        winner, winner_state = max(
+            states.items(),
+            key=lambda item: (item[1].modified_time, item[1].percent or -1.0, item[0]),
+        )
+        return winner if winner_state else None
+
+    if any(state.percent is None for state in states.values()):
         return None
-    if moon.percent == foliate.percent:
-        return APP_MOON if moon.modified_time >= foliate.modified_time else APP_FOLIATE
-    return APP_MOON if moon.percent > foliate.percent else APP_FOLIATE
+
+    winner, _ = max(
+        states.items(),
+        key=lambda item: (item[1].percent or -1.0, item[1].modified_time, item[0]),
+    )
+    return winner
 
 
 def update_foliate_from_moon(foliate: FoliateState, moon: MoonState) -> bool:
@@ -903,7 +1241,39 @@ def update_foliate_from_moon(foliate: FoliateState, moon: MoonState) -> bool:
     return changed
 
 
-def update_moon_from_foliate(moon: MoonState, foliate: FoliateState) -> MoonSyncResult:
+def update_foliate_from_epw(foliate: FoliateState, epw: EPWState) -> bool:
+    """Write EPW progress into a Foliate JSON file."""
+
+    if epw.percent is None:
+        return False
+
+    total = foliate.progress_total or 1000
+    current = min(total, max(0, round((epw.percent / 100) * total)))
+    payload = foliate.payload
+    changed = payload.get("progress") != [current, total]
+    payload["progress"] = [current, total]
+
+    metadata = payload.setdefault("metadata", {})
+    if isinstance(metadata, dict):
+        modified = iso_utc_now()
+        if metadata.get("modified") != modified:
+            changed = True
+        metadata["modified"] = modified
+
+    synthesized_location = synthesize_foliate_location_from_epw(foliate, epw)
+    if synthesized_location and payload.get("lastLocation") != synthesized_location:
+        payload["lastLocation"] = synthesized_location
+        changed = True
+
+    if changed:
+        foliate.path.write_text(
+            json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
+            encoding="utf-8",
+        )
+    return changed
+
+
+def update_moon_from_foliate(moon: MoonState, foliate: FoliateState) -> UpdateResult:
     """Write Foliate's progress back into a Moon+ state file.
 
     Exact reverse mapping from EPUB CFI to Moon+'s location format is not
@@ -913,20 +1283,20 @@ def update_moon_from_foliate(moon: MoonState, foliate: FoliateState) -> MoonSync
     """
 
     if foliate.percent is None:
-        return MoonSyncResult(False, "Foliate state has no usable progress value.")
+        return UpdateResult(False, "Foliate state has no usable progress value.")
 
     # Compact Moon+ files need approximation because Foliate's CFI cannot be
     # translated into Moon+'s internal locator exactly.
     if moon.format_type == "compact":
         book_path = resolve_foliate_book_path(foliate)
         if not book_path:
-            return MoonSyncResult(
+            return UpdateResult(
                 False,
                 f"Could not approximate Foliate -> Moon+ for '{moon.title}' because the EPUB file is not accessible.",
             )
         new_text = moon_compact_from_spine_boundary(moon, foliate, book_path)
         if new_text is None:
-            return MoonSyncResult(
+            return UpdateResult(
                 False,
                 f"Could not approximate Foliate -> Moon+ for '{moon.title}' from the EPUB spine/CFI data.",
             )
@@ -934,10 +1304,33 @@ def update_moon_from_foliate(moon: MoonState, foliate: FoliateState) -> MoonSync
         new_text = build_kv_moon_state(moon, foliate.percent)
 
     if new_text == moon.raw_text:
-        return MoonSyncResult(False)
+        return UpdateResult(False)
 
     moon.path.write_text(new_text, encoding="utf-8")
-    return MoonSyncResult(True)
+    return UpdateResult(True)
+
+
+def update_moon_from_epw(moon: MoonState, epw: EPWState) -> UpdateResult:
+    """Write EPW progress into a Moon+ state file."""
+
+    if epw.percent is None:
+        return UpdateResult(False, "EPW state has no usable progress value.")
+
+    if moon.format_type == "compact":
+        new_text = moon_compact_from_epw(moon, epw)
+        if new_text is None:
+            return UpdateResult(
+                False,
+                f"Could not approximate EPW -> Moon+ for '{moon.title}' from the stored content index.",
+            )
+    else:
+        new_text = build_kv_moon_state(moon, epw.percent)
+
+    if new_text == moon.raw_text:
+        return UpdateResult(False)
+
+    moon.path.write_text(new_text, encoding="utf-8")
+    return UpdateResult(True)
 
 
 def build_compact_moon_state(moon: MoonState, percent: float) -> str:
@@ -980,44 +1373,327 @@ def build_kv_moon_state(moon: MoonState, percent: float) -> str:
     return "\n".join(lines)
 
 
+def upsert_epw_state(
+    db_path: Path,
+    filepath: str,
+    title: str,
+    author: str,
+    percent: float | None,
+    content_index: int,
+    textwidth: int,
+    row: int,
+    rel_pctg: float | None,
+) -> bool:
+    """Insert or update an EPW reading state plus its library row."""
+
+    init_epw_db(db_path)
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute("PRAGMA foreign_keys = ON")
+        existing = conn.execute(
+            """
+            SELECT rs.content_index, rs.textwidth, rs.row, rs.rel_pctg,
+                   l.title, l.author, l.reading_progress
+            FROM reading_states rs
+            LEFT JOIN library l ON l.filepath = rs.filepath
+            WHERE rs.filepath = ?
+            """,
+            (filepath,),
+        ).fetchone()
+
+        reading_progress = None if percent is None else percent / 100
+        changed = (
+            existing is None
+            or existing[0] != content_index
+            or existing[1] != textwidth
+            or existing[2] != row
+            or existing[3] != rel_pctg
+            or existing[4] != title
+            or existing[5] != author
+            or existing[6] != reading_progress
+        )
+
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO reading_states
+            (filepath, content_index, textwidth, row, rel_pctg)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (filepath, content_index, textwidth, row, rel_pctg),
+        )
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO library
+            (filepath, title, author, reading_progress)
+            VALUES (?, ?, ?, ?)
+            """,
+            (filepath, title, author, reading_progress),
+        )
+        conn.commit()
+        return changed
+    finally:
+        conn.close()
+
+
+def update_epw_from_foliate(epw: EPWState, foliate: FoliateState) -> UpdateResult:
+    """Write Foliate progress into EPW's SQLite state."""
+
+    if foliate.percent is None:
+        return UpdateResult(False, "Foliate state has no usable progress value.")
+
+    content_index = choose_epw_content_index_from_foliate(foliate, epw.filepath)
+    if content_index is None:
+        return UpdateResult(
+            False,
+            f"Could not approximate Foliate -> EPW for '{epw.title or foliate.title}' because no content index could be derived.",
+        )
+
+    changed = upsert_epw_state(
+        epw.db_path,
+        epw.filepath,
+        epw.title or foliate.title,
+        epw.author or foliate.author,
+        foliate.percent,
+        content_index,
+        epw.textwidth or 80,
+        0,
+        0.0,
+    )
+    return UpdateResult(changed)
+
+
+def update_epw_from_moon(epw: EPWState, moon: MoonState) -> UpdateResult:
+    """Write Moon+ progress into EPW's SQLite state."""
+
+    if moon.percent is None:
+        return UpdateResult(False, "Moon+ state has no usable progress value.")
+
+    content_index = choose_epw_content_index_from_moon(moon, epw.filepath)
+    if content_index is None:
+        return UpdateResult(
+            False,
+            f"Could not approximate Moon+ -> EPW for '{moon.title}' because no content index could be derived.",
+        )
+
+    changed = upsert_epw_state(
+        epw.db_path,
+        epw.filepath,
+        epw.title or moon.title,
+        epw.author or moon.author,
+        moon.percent,
+        content_index,
+        epw.textwidth or 80,
+        0,
+        0.0,
+    )
+    return UpdateResult(changed)
+
+
+def create_epw_state_from_foliate(db_path: Path, foliate: FoliateState) -> UpdateResult:
+    """Create a missing EPW entry from an existing Foliate state."""
+
+    locator = get_foliate_book_locator(foliate)
+    book_path = resolve_foliate_book_path(foliate)
+    if not locator or not book_path:
+        return UpdateResult(
+            False,
+            f"Could not create EPW state for '{foliate.title}' because Foliate does not expose an accessible local book path.",
+        )
+
+    content_index = choose_epw_content_index_from_foliate(foliate, str(book_path))
+    if content_index is None:
+        return UpdateResult(
+            False,
+            f"Could not create EPW state for '{foliate.title}' because no content index could be derived.",
+        )
+
+    changed = upsert_epw_state(
+        resolve_epw_db_path(db_path),
+        str(book_path),
+        foliate.title,
+        foliate.author,
+        foliate.percent,
+        content_index,
+        80,
+        0,
+        0.0,
+    )
+    return UpdateResult(changed)
+
+
+def create_foliate_state_from_epw(foliate_dir: Path, epw: EPWState) -> UpdateResult:
+    """Create a missing Foliate entry from an existing EPW state."""
+
+    book_path = epw_local_book_path(epw.filepath)
+    if not book_path or not book_path.exists():
+        return UpdateResult(
+            False,
+            f"Could not create Foliate state for '{epw.title}' because EPW does not point at an accessible local file.",
+        )
+
+    try:
+        epub_metadata = read_epub_metadata(book_path)
+        identifier = epub_metadata.get("identifier") or make_foliate_fallback_identifier(book_path)
+    except OSError as exc:
+        return UpdateResult(False, f"Could not create Foliate state for '{epw.title}': {exc}")
+
+    metadata = {
+        "identifier": identifier,
+        "title": epub_metadata.get("title") or epw.title,
+        "author": {"name": epub_metadata.get("author") or epw.author},
+        "modified": iso_utc_now(),
+    }
+    total = 1000
+    current = round(((epw.percent or 0.0) / 100) * total)
+    payload = {
+        "metadata": metadata,
+        "progress": [current, total],
+    }
+
+    cfi = build_spine_item_start_cfi(book_path, epw.content_index + 1)
+    if cfi:
+        payload["lastLocation"] = cfi
+
+    state_path = foliate_dir / f"{identifier}.json"
+    changed = True
+    if state_path.exists():
+        try:
+            existing = json.loads(state_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            existing = {}
+        changed = existing != payload
+
+    state_path.write_text(
+        json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
+        encoding="utf-8",
+    )
+
+    uri_store = load_foliate_uri_store(foliate_dir)
+    desired_uri = foliate_store_value_for_path(book_path)
+    if uri_store.get(identifier) != desired_uri:
+        uri_store[identifier] = desired_uri
+        save_foliate_uri_store(foliate_dir, uri_store)
+        changed = True
+
+    return UpdateResult(changed)
+
+
 def iso_utc_now() -> str:
     """Return the current time in the ISO-8601 UTC form Foliate already uses."""
 
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
 
-def sync_states(args: argparse.Namespace, moon_dir: Path, foliate_dir: Path) -> int:
-    """Load, match, resolve, and sync all eligible titles.
-
-    Only books present on both sides are considered. This matches the current
-    plan requirement to skip one-sided entries for now.
-    """
-
-    # Load each application's state into normalized lookup tables first. This
-    # makes the actual sync loop easy to follow.
-    moon_states = load_moon_states(moon_dir)
-    foliate_states = load_foliate_states(foliate_dir)
-    matched_keys = sorted(set(moon_states).intersection(foliate_states))
+def bootstrap_missing_foliate_epw_entries(
+    foliate_dir: Path,
+    epw_db_path: Path,
+    foliate_by_filepath: dict[str, FoliateState],
+    epw_by_filepath: dict[str, EPWState],
+) -> tuple[int, list[str]]:
+    """Create missing Foliate/EPW entries when one side already knows the filepath."""
 
     updates = 0
     warnings: list[str] = []
-    for key in matched_keys:
-        # Each matched key represents one logical book present on both sides.
-        moon = moon_states[key]
-        foliate = foliate_states[key]
-        winner = choose_winner(args, moon, foliate)
+
+    for filepath, foliate in foliate_by_filepath.items():
+        if filepath in epw_by_filepath:
+            continue
+        result = create_epw_state_from_foliate(epw_db_path, foliate)
+        if result.changed:
+            updates += 1
+        if result.warning:
+            warnings.append(result.warning)
+
+    for filepath, epw in epw_by_filepath.items():
+        if filepath in foliate_by_filepath:
+            continue
+        result = create_foliate_state_from_epw(foliate_dir, epw)
+        if result.changed:
+            updates += 1
+        if result.warning:
+            warnings.append(result.warning)
+
+    return updates, warnings
+
+
+def update_target_from_source(target_app: str, target: Any, source_app: str, source: Any) -> UpdateResult:
+    """Dispatch one cross-application update."""
+
+    if target_app == APP_FOLIATE and source_app == APP_MOON:
+        return UpdateResult(update_foliate_from_moon(target, source))
+    if target_app == APP_FOLIATE and source_app == APP_EPW:
+        return UpdateResult(update_foliate_from_epw(target, source))
+    if target_app == APP_MOON and source_app == APP_FOLIATE:
+        return update_moon_from_foliate(target, source)
+    if target_app == APP_MOON and source_app == APP_EPW:
+        return update_moon_from_epw(target, source)
+    if target_app == APP_EPW and source_app == APP_FOLIATE:
+        return update_epw_from_foliate(target, source)
+    if target_app == APP_EPW and source_app == APP_MOON:
+        return update_epw_from_moon(target, source)
+    return UpdateResult(False, f"Unsupported sync direction: {source_app} -> {target_app}")
+
+
+def sync_states(
+    args: argparse.Namespace,
+    moon_dir: Path,
+    foliate_dir: Path,
+    epw_path: Path | None = None,
+) -> int:
+    """Load, match, resolve, and sync all eligible titles.
+
+    Books are matched by normalized title/author across the configured apps.
+    Foliate and EPW also bootstrap missing entries from filepath when one side
+    already knows the book.
+    """
+
+    moon_states = load_moon_states(moon_dir)
+    foliate_states = load_foliate_states(foliate_dir)
+    updates = 0
+    warnings: list[str] = []
+
+    epw_states: dict[tuple[str, str], EPWState] = {}
+    if epw_path is not None:
+        epw_states, epw_by_filepath = load_epw_states(epw_path)
+        foliate_by_filepath = build_foliate_filepath_map(foliate_states)
+        bootstrap_updates, bootstrap_warnings = bootstrap_missing_foliate_epw_entries(
+            foliate_dir,
+            epw_path,
+            foliate_by_filepath,
+            epw_by_filepath,
+        )
+        updates += bootstrap_updates
+        warnings.extend(bootstrap_warnings)
+
+        # Reload after bootstrapping so newly created entries can participate in
+        # the normal winner-selection pass.
+        foliate_states = load_foliate_states(foliate_dir)
+        epw_states, _ = load_epw_states(epw_path)
+
+    all_keys = sorted(set(moon_states) | set(foliate_states) | set(epw_states))
+    for key in all_keys:
+        states: dict[str, Any] = {}
+        if key in moon_states:
+            states[APP_MOON] = moon_states[key]
+        if key in foliate_states:
+            states[APP_FOLIATE] = foliate_states[key]
+        if key in epw_states:
+            states[APP_EPW] = epw_states[key]
+        if len(states) < 2:
+            continue
+
+        winner = choose_winner(args, states)
         if not winner:
             continue
 
-        if winner == APP_MOON:
-            if update_foliate_from_moon(foliate, moon):
+        for app_name, state in states.items():
+            if app_name == winner:
+                continue
+            result = update_target_from_source(app_name, state, winner, states[winner])
+            if result.changed:
                 updates += 1
-        else:
-            moon_result = update_moon_from_foliate(moon, foliate)
-            if moon_result.changed:
-                updates += 1
-            if moon_result.warning:
-                warnings.append(moon_result.warning)
+            if result.warning:
+                warnings.append(result.warning)
 
     # Warnings are emitted after the sync loop so normal per-book processing
     # stays simple and the user still sees all issues found during the run.
@@ -1045,6 +1721,7 @@ def main() -> int:
         args,
         env_directories[APP_MOON],
         env_directories[APP_FOLIATE],
+        env_directories.get(APP_EPW),
     )
     print(f"Updated {updates} reading state file(s).")
     return 0
