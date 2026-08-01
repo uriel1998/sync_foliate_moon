@@ -2,6 +2,12 @@
 
 Reading-state sync across Moon+ Reader, Foliate, and EPW.
 
+The readers involved here are:
+
+- [Moon+ Reader](https://www.moondownload.com/), an Android ebook reader
+- [Foliate](https://johnfactotum.github.io/foliate/), an ebook reader for Linux
+- [epw](https://github.com/uriel1998/epw), an ebook reader for the terminal and a fork of epy, which is itself a fork of epr
+
 This project synchronizes reading state between:
 
 - Moon+ sidecar files such as `Title - Author.epub.po`
