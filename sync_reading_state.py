@@ -102,7 +102,7 @@ class MoonState:
 
     Why normalize?
     Moon+ state files are not rigidly schema-driven. The reference material in
-    `1_reference/` shows at least two shapes:
+    the reference material shows at least two shapes:
 
     - a compact single-line form:
       `timestamp*chapter@page#offset:percent%`
@@ -226,13 +226,15 @@ def ensure_venv() -> None:
     """Run the script inside a local virtual environment.
 
     How it works:
-    - if the current interpreter is already inside a venv, install
+    - if the current interpreter is already inside a virtual environment, install
       `requirements.txt` and continue
-    - otherwise, create `.venv` if needed, then re-exec this script with the
-      venv's Python interpreter while preserving the original CLI arguments
+    - otherwise, create the local virtual environment if needed, then re-exec
+      this script with that interpreter while preserving the original CLI
+      arguments
 
     This follows the repo plan literally: environment setup happens before any
-    application-specific work such as parsing `.env` or touching state files.
+    application-specific work such as parsing configuration or touching state
+    files.
     """
 
     # `root` anchors all repo-local files, regardless of the directory from
@@ -319,7 +321,7 @@ def parse_args() -> argparse.Namespace:
 
 
 def load_env_directories(env_path: Path) -> tuple[dict[str, Path], Path | None]:
-    """Read application directories and optional Calibre DB from `.env`.
+    """Read application directories and optional Calibre DB from the local config file.
 
     Expected format:
         Moon:/path/to/moon/files
@@ -335,7 +337,7 @@ def load_env_directories(env_path: Path) -> tuple[dict[str, Path], Path | None]:
     directories: dict[str, Path] = {}
     calibre_db_path: Path | None = None
     if not env_path.exists():
-        raise FileNotFoundError(f"Missing .env file at {env_path}")
+        raise FileNotFoundError(f"Missing local config file at {env_path}")
 
     for raw_line in env_path.read_text(encoding="utf-8").splitlines():
         line = raw_line.strip()
@@ -352,7 +354,7 @@ def load_env_directories(env_path: Path) -> tuple[dict[str, Path], Path | None]:
         # contain additional colons after the application name.
         app, sep, directory = line.partition(":")
         if not sep:
-            raise ValueError(f"Invalid .env entry: {raw_line!r}")
+            raise ValueError(f"Invalid config entry: {raw_line!r}")
         app = app.strip()
         if app not in SUPPORTED_APPS:
             continue
@@ -360,7 +362,7 @@ def load_env_directories(env_path: Path) -> tuple[dict[str, Path], Path | None]:
 
     missing = REQUIRED_APPS - directories.keys()
     if missing:
-        raise ValueError(f"Missing application directories in .env: {sorted(missing)}")
+        raise ValueError(f"Missing application directories in local config: {sorted(missing)}")
     return directories, calibre_db_path
 
 
@@ -2128,7 +2130,7 @@ def main() -> int:
     Order matters here:
     1. bootstrap the environment
     2. parse CLI arguments
-    3. resolve directories from the repository-local `.env`
+    3. resolve directories from the repository-local config file
     4. perform sync
     """
 
@@ -2144,7 +2146,7 @@ def main() -> int:
     # still allowing `-h/--help` and argument errors to return before bootstrap.
     ensure_venv()
     env_directories, calibre_db_path = load_env_directories(script_root() / ".env")
-    loud_print(args, "Loaded configuration from .env")
+    loud_print(args, "Loaded configuration from local config file")
     updates = sync_states(
         args,
         env_directories[APP_MOON],

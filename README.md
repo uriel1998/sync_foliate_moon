@@ -30,9 +30,9 @@ Note:  While I use Calibre for library management, I have Foliate configured as 
 
 ## Features
 
-- Creates and uses a local `.venv`
+- Creates and uses a local virtual environment
 - Installs dependencies from `requirements.txt`
-- Reads Moon+, Foliate, optional EPW locations, and optional `Calibre_DB` from `.env`
+- Reads Moon+, Foliate, optional EPW locations, and optional `Calibre_DB` from its local config file
 - Matches books by normalized `title + author`
 - Supports conflict resolution with `--position`, `--date`, `--moon`, `--foliate`, and `--epw`
 - Supports `--loud` for noisy step-by-step progress output
@@ -47,13 +47,13 @@ Note:  While I use Calibre for library management, I have Foliate configured as 
 
 ## Quick Start
 
-1. Create your local config:
+1. Create your local config from the example file:
 
 ```bash
-cp env.example .env
+cp env.example your-local-config
 ```
 
-2. Edit `.env` so it points at your real state directories:
+2. Rename that file to the expected local config filename and edit it so it points at your real state directories:
 
 ```text
 Moon:/path/to/Moon+/
@@ -91,17 +91,17 @@ The script follows a fixed sequence.
 
 Before doing any sync work, the script:
 
-- handles `-h`, `--help`, and invalid arguments first, so CLI help/errors exit cleanly without bootstrapping the venv
+- handles `-h`, `--help`, and invalid arguments first, so CLI help/errors exit cleanly without bootstrapping the virtual environment
 - checks whether it is already running in a virtual environment
-- creates `.venv` if needed
+- creates its local virtual environment if needed
 - re-executes itself with the venv Python interpreter
 - installs everything from `requirements.txt`
 
-This happens before parsing `.env` or touching any reading state files.
+This happens before parsing its local config or touching any reading state files.
 
 ### 2. Read Configuration
 
-The script reads `.env` from the same real directory as `sync_reading_state.py`.
+The script reads its local config file from the same real directory as `sync_reading_state.py`.
 
 That means it still finds the correct config when you:
 
@@ -396,7 +396,6 @@ The script skips:
 - [`sync_reading_state.py`](./sync_reading_state.py): main script
 - [`requirements.txt`](./requirements.txt): Python dependencies
 - [`env.example`](./env.example): example configuration
-- [`1_reference/`](./1_reference/): reference notes and sample data used to derive the implementation
 
 ## License
 
