@@ -305,7 +305,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--loud",
         action="store_true",
-        help="Print noisy step-by-step progress output.",
+        help="Print noisy step-by-step progress output and non-fatal warnings.",
     )
     return parser.parse_args()
 

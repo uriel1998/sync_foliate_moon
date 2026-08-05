@@ -41,8 +41,9 @@ Note:  While I use Calibre for library management, I have Foliate configured as 
 - Updates EPW SQLite reading state directly
 - Attempts approximate Foliate -> Moon+ compact sync using the actual EPUB spine
 - Bootstraps missing Foliate/EPW entries when one side already knows the book filepath
+- Skips EPW entries whose `filepath` is actually a URL rather than a local file
 - Populates Foliate's cached cover image when a Calibre cover or EPUB cover can be resolved during Foliate entry creation
-- Prints visible warnings when a reverse approximation cannot be performed safely
+- Counts only actual reading-position changes in the final `Updated N reading state file(s).` summary
 
 ## Quick Start
 
@@ -245,7 +246,7 @@ Print step-by-step progress output, including:
 - bootstrap creation steps
 - per-book winner selection
 - per-target update attempts
-- inline warnings as they occur
+- inline non-fatal warnings as they occur
 
 ### 7. Write The Loser
 
@@ -295,6 +296,9 @@ The resulting compact state is intentionally boundary-based. It resets page and 
 
 When Foliate and EPW both know the same book filepath, the script can sync them
 even if one side did not previously have a saved reading-state entry.
+
+EPW entries that point at URLs instead of local files are skipped, because the
+current sync logic needs direct filesystem access to the book.
 
 Foliate -> EPW:
 
@@ -361,6 +365,17 @@ Foliate -> Moon+ compact sync is section-level only. It does not reconstruct Moo
 ### Missing EPUB Access Limits Reverse Sync
 
 If the actual EPUB file cannot be resolved through Foliate's URI store, the script cannot perform compact reverse approximation safely. In that case it prints a warning and leaves the Moon+ compact file unchanged.
+
+### Update Count Means Position Changes
+
+The final `Updated N reading state file(s).` summary counts only actual
+reading-position changes.
+
+It does not count:
+
+- bootstrap creation of a missing Foliate or EPW entry
+- Foliate cover-cache writes
+- metadata-only writes such as refreshed timestamps or title/author normalization
 
 ### Some One-Sided Books Are Still Skipped
 
