@@ -62,8 +62,8 @@ EPW:/path/to/epw/or/states.db
 Calibre_DB=/path/to/CalibreLibrary/metadata.db
 ```
 
-I am using Moon+'s cloud sync with NextCloud, and then NextCloud's app to sync with my desktop.
-If you installed Foliate via Flatpak, look in `$HOME/.var/app/com.github.johnfactotum.Foliate/data/com.github.johnfactotum.Foliate/` 
+All paths above are examples.
+If you installed Foliate via Flatpak, one common example location is `$HOME/.var/app/com.github.johnfactotum.Foliate/data/com.github.johnfactotum.Foliate/`.
 
 3. Run the sync:
 

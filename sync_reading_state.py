@@ -81,6 +81,14 @@ def script_path() -> Path:
     return Path(__file__).resolve()
 
 
+def venv_python_path(venv_dir: Path) -> Path:
+    """Return the platform-appropriate Python executable inside a venv."""
+
+    if os.name == "nt":
+        return venv_dir / "Scripts" / "python.exe"
+    return venv_dir / "bin" / "python"
+
+
 def loud_print(args: argparse.Namespace | None, message: str) -> None:
     """Emit step-by-step progress when `--loud` is enabled."""
 
@@ -244,7 +252,7 @@ def ensure_venv() -> None:
         # Instead of trying to "activate" a venv in the shell sense, the script
         # simply re-executes itself with the venv's interpreter. That is more
         # reliable and keeps all original command-line arguments intact.
-        python_path = venv_dir / "bin" / "python"
+        python_path = venv_python_path(venv_dir)
         env = os.environ.copy()
         env["SYNC_EBOOK_BOOTSTRAPPED"] = "1"
         subprocess.check_call(
