@@ -32,14 +32,16 @@ Note:  While I use Calibre for library management, I have Foliate configured as 
 
 - Creates and uses a local `.venv`
 - Installs dependencies from `requirements.txt`
-- Reads Moon+, Foliate, and optional EPW locations from `.env`
+- Reads Moon+, Foliate, optional EPW locations, and optional `Calibre_DB` from `.env`
 - Matches books by normalized `title + author`
 - Supports conflict resolution with `--position`, `--date`, `--moon`, `--foliate`, and `--epw`
+- Supports `--loud` for noisy step-by-step progress output
 - Updates Foliate progress and approximate reopen position
 - Updates Moon+ key/value states directly
 - Updates EPW SQLite reading state directly
 - Attempts approximate Foliate -> Moon+ compact sync using the actual EPUB spine
 - Bootstraps missing Foliate/EPW entries when one side already knows the book filepath
+- Populates Foliate's cached cover image when a Calibre cover or EPUB cover can be resolved during Foliate entry creation
 - Prints visible warnings when a reverse approximation cannot be performed safely
 
 ## Quick Start
@@ -56,6 +58,7 @@ cp env.example .env
 Moon:/path/to/Moon+/
 Foliate:/path/to/com.github.johnfactotum.Foliate/
 EPW:/path/to/epw/or/states.db
+Calibre_DB=/path/to/CalibreLibrary/metadata.db
 ```
 
 I am using Moon+'s cloud sync with NextCloud, and then NextCloud's app to sync with my desktop.
@@ -75,6 +78,7 @@ If you installed Foliate via Flatpak, look in `$HOME/.var/app/com.github.johnfac
 ./sync_reading_state.py --moon
 ./sync_reading_state.py --foliate
 ./sync_reading_state.py --epw
+./sync_reading_state.py --loud
 ./sync_reading_state.py --help
 ```
 
@@ -86,6 +90,7 @@ The script follows a fixed sequence.
 
 Before doing any sync work, the script:
 
+- handles `-h`, `--help`, and invalid arguments first, so CLI help/errors exit cleanly without bootstrapping the venv
 - checks whether it is already running in a virtual environment
 - creates `.venv` if needed
 - re-executes itself with the venv Python interpreter
@@ -103,10 +108,16 @@ That means it still finds the correct config when you:
 - invoke it through a symlink
 - schedule it with cron
 
-Each non-empty, non-comment line must be:
+Application entries use:
 
 ```text
 APPLICATION:directory
+```
+
+The optional Calibre database entry uses:
+
+```text
+Calibre_DB=/path/to/CalibreLibrary/metadata.db
 ```
 
 Currently supported applications:
@@ -116,6 +127,11 @@ Currently supported applications:
 - `EPW`
 
 Unknown application names are ignored.
+
+If `Calibre_DB` is configured, the script can use Calibre's `metadata.db` to
+recover real ebook file paths from title/author matches. That especially helps
+Moon+ one-sided books, since Moon+ itself does not store a stable library
+filepath.
 
 ### 3. Load Moon+ State
 
@@ -183,6 +199,16 @@ Foliate and EPW can also bootstrap one-sided entries when one side already
 knows the real book filepath. That lets them sync even if the book has not yet
 been opened in the other application.
 
+If `Calibre_DB` is configured, Moon+ can also participate in that bootstrap
+path indirectly: the script can match the Moon+ title/author to Calibre and use
+the Calibre library path to create missing Foliate or EPW state.
+
+When that Calibre-backed path is used to create a Foliate entry, the script
+also tries to populate Foliate's cached cover image:
+
+- first from Calibre's sibling `cover.jpg`
+- otherwise from the EPUB's embedded cover image
+
 ### 6. Choose a Winner
 
 For each matched book, the script picks which side wins.
@@ -210,6 +236,16 @@ Foliate always wins.
 #### `--epw`
 
 EPW always wins.
+
+#### `--loud`
+
+Print step-by-step progress output, including:
+
+- configured paths and loaded state counts
+- bootstrap creation steps
+- per-book winner selection
+- per-target update attempts
+- inline warnings as they occur
 
 ### 7. Write The Loser
 

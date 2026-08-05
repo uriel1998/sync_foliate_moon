@@ -54,6 +54,7 @@ from zipfile import ZipFile
 APP_MOON = "Moon"
 APP_FOLIATE = "Foliate"
 APP_EPW = "EPW"
+CONFIG_CALIBRE_DB = "Calibre_DB"
 SUPPORTED_APPS = {APP_MOON, APP_FOLIATE, APP_EPW}
 REQUIRED_APPS = {APP_MOON, APP_FOLIATE}
 COMPACT_MOON_RE = re.compile(
@@ -78,6 +79,13 @@ def script_path() -> Path:
     """Return the canonical path to this script."""
 
     return Path(__file__).resolve()
+
+
+def loud_print(args: argparse.Namespace | None, message: str) -> None:
+    """Emit step-by-step progress when `--loud` is enabled."""
+
+    if args is not None and getattr(args, "loud", False):
+        print(message)
 
 
 @dataclass
@@ -162,6 +170,15 @@ class EPWState:
 
 
 @dataclass
+class CalibreBook:
+    """Minimal Calibre metadata needed to resolve a real book filepath."""
+
+    title: str
+    author: str
+    book_path: Path
+
+
+@dataclass
 class UpdateResult:
     """Result of attempting to update one app's stored state.
 
@@ -174,6 +191,26 @@ class UpdateResult:
 
     changed: bool
     warning: str | None = None
+
+
+class ArgumentParseExit(Exception):
+    """Controlled argparse exit so CLI handling can return cleanly."""
+
+    def __init__(self, status: int = 0, message: str | None = None) -> None:
+        super().__init__(message)
+        self.status = status
+        self.message = message
+
+
+class CleanArgumentParser(argparse.ArgumentParser):
+    """Argument parser that exits cleanly without an uncaught SystemExit."""
+
+    def exit(self, status: int = 0, message: str | None = None) -> None:
+        raise ArgumentParseExit(status, message)
+
+    def error(self, message: str) -> None:
+        self.print_usage(sys.stderr)
+        raise ArgumentParseExit(2, f"{self.prog}: error: {message}\n")
 
 
 def ensure_venv() -> None:
@@ -235,7 +272,7 @@ def parse_args() -> argparse.Namespace:
 
     # These options are mutually exclusive because a single run should use
     # exactly one rule for choosing the source of truth.
-    parser = argparse.ArgumentParser(
+    parser = CleanArgumentParser(
         description="Sync reading position across Moon+ Reader, Foliate, and EPW."
     )
     group = parser.add_mutually_exclusive_group()
@@ -264,15 +301,21 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Always prefer the EPW state.",
     )
+    parser.add_argument(
+        "--loud",
+        action="store_true",
+        help="Print noisy step-by-step progress output.",
+    )
     return parser.parse_args()
 
 
-def load_env_directories(env_path: Path) -> dict[str, Path]:
-    """Read application directories from the repository-local `.env`.
+def load_env_directories(env_path: Path) -> tuple[dict[str, Path], Path | None]:
+    """Read application directories and optional Calibre DB from `.env`.
 
     Expected format:
         Moon:/path/to/moon/files
         Foliate:/path/to/foliate/files
+        Calibre_DB=/path/to/metadata.db
 
     Unknown app names are ignored so the file can hold extra local notes without
     breaking the sync process.
@@ -281,12 +324,20 @@ def load_env_directories(env_path: Path) -> dict[str, Path]:
     # The env file is intentionally very small and custom. Using a trivial
     # parser keeps the configuration format obvious to non-Python users.
     directories: dict[str, Path] = {}
+    calibre_db_path: Path | None = None
     if not env_path.exists():
         raise FileNotFoundError(f"Missing .env file at {env_path}")
 
     for raw_line in env_path.read_text(encoding="utf-8").splitlines():
         line = raw_line.strip()
         if not line or line.startswith("#"):
+            continue
+        if line.startswith(f"{CONFIG_CALIBRE_DB}=") or line.startswith(f"{CONFIG_CALIBRE_DB}:"):
+            _, sep, db_path = line.partition("=")
+            if not sep:
+                _, _, db_path = line.partition(":")
+            if db_path.strip():
+                calibre_db_path = Path(db_path.strip()).expanduser()
             continue
         # `partition` splits only on the first `:`, which allows paths to
         # contain additional colons after the application name.
@@ -301,7 +352,7 @@ def load_env_directories(env_path: Path) -> dict[str, Path]:
     missing = REQUIRED_APPS - directories.keys()
     if missing:
         raise ValueError(f"Missing application directories in .env: {sorted(missing)}")
-    return directories
+    return directories, calibre_db_path
 
 
 def normalize_name(value: str) -> str:
@@ -707,6 +758,16 @@ def save_foliate_uri_store(foliate_dir: Path, mapping: dict[str, str]) -> None:
     )
 
 
+def foliate_cache_dir(foliate_dir: Path) -> Path:
+    """Return Foliate's cache directory based on its configured data dir."""
+
+    foliate_dir = foliate_dir.expanduser()
+    if foliate_dir.parent.name == "data":
+        root = foliate_dir.parent.parent
+        return root / "cache" / foliate_dir.name
+    return foliate_dir.parent / "cache" / foliate_dir.name
+
+
 def foliate_store_value_for_path(book_path: Path) -> str:
     """Format a local path the way Foliate stores it in `uri-store.json`."""
 
@@ -843,12 +904,91 @@ def read_epub_metadata(book_path: Path) -> dict[str, str]:
     return metadata
 
 
+def read_epub_cover_bytes(book_path: Path) -> bytes | None:
+    """Return raw EPUB cover-image bytes when the package declares one."""
+
+    try:
+        with ZipFile(book_path) as archive:
+            opf_path, _ = read_epub_package(archive)
+            opf_dir = Path(opf_path).parent
+            opf = ET.fromstring(archive.read(opf_path))
+    except (KeyError, OSError, ET.ParseError):
+        return None
+
+    ns = {
+        "opf": "http://www.idpf.org/2007/opf",
+        "dc": "http://purl.org/dc/elements/1.1/",
+    }
+
+    manifest = {
+        item.attrib.get("id"): item.attrib.get("href")
+        for item in opf.findall(".//opf:item", ns)
+        if item.attrib.get("id") and item.attrib.get("href")
+    }
+
+    cover_id = None
+    for meta in opf.findall(".//opf:metadata/opf:meta", ns):
+        if meta.attrib.get("name") == "cover" and meta.attrib.get("content"):
+            cover_id = meta.attrib["content"]
+            break
+
+    if cover_id is None:
+        for item in opf.findall(".//opf:item", ns):
+            properties = item.attrib.get("properties", "")
+            if "cover-image" in properties.split():
+                href = item.attrib.get("href")
+                if href:
+                    try:
+                        return archive.read((opf_dir / href).as_posix())
+                    except KeyError:
+                        return None
+        return None
+
+    href = manifest.get(cover_id)
+    if not href:
+        return None
+    try:
+        return archive.read((opf_dir / href).as_posix())
+    except KeyError:
+        return None
+
+
 def make_foliate_fallback_identifier(book_path: Path) -> str:
     """Match Foliate's fallback identifier generation for local files."""
 
     with book_path.open("rb") as handle:
         digest = hashlib.md5(handle.read(10_000_000)).hexdigest()
     return f"foliate:{digest}"
+
+
+def save_foliate_cover_cache(foliate_dir: Path, identifier: str, book_path: Path) -> bool:
+    """Best-effort populate Foliate's cover cache from Calibre or EPUB data."""
+
+    cache_path = foliate_cache_dir(foliate_dir) / f"{quote_identifier(identifier)}.png"
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+
+    calibre_cover = book_path.parent / "cover.jpg"
+    if calibre_cover.exists():
+        source_bytes = calibre_cover.read_bytes()
+    else:
+        source_bytes = read_epub_cover_bytes(book_path)
+
+    if not source_bytes:
+        return False
+
+    if cache_path.exists() and cache_path.read_bytes() == source_bytes:
+        return False
+
+    cache_path.write_bytes(source_bytes)
+    return True
+
+
+def quote_identifier(identifier: str) -> str:
+    """Match Foliate's `encodeURIComponent(identifier)` cache filename style."""
+
+    from urllib.parse import quote
+
+    return quote(identifier, safe="")
 
 
 def choose_spine_index(moon: MoonState, spine_length: int) -> int | None:
@@ -1165,6 +1305,89 @@ def load_epw_states(
             by_key[(normalize_name(state.title), normalize_name(state.author))] = state
 
     return by_key, by_filepath
+
+
+def load_calibre_books(db_path: Path) -> dict[tuple[str, str], list[CalibreBook]]:
+    """Load Calibre title/author -> book filepath mappings from `metadata.db`."""
+
+    db_path = db_path.expanduser()
+    if not db_path.exists():
+        return {}
+
+    library_root = db_path.parent
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    try:
+        rows = conn.execute(
+            """
+            SELECT
+                b.id AS book_id,
+                b.title AS title,
+                b.path AS book_dir,
+                d.name AS file_stem,
+                d.format AS file_format,
+                bal.id AS author_order,
+                a.name AS author_name
+            FROM books b
+            JOIN data d ON d.book = b.id
+            LEFT JOIN books_authors_link bal ON bal.book = b.id
+            LEFT JOIN authors a ON a.id = bal.author
+            ORDER BY b.id, bal.id, d.format
+            """
+        ).fetchall()
+    finally:
+        conn.close()
+
+    preferred_formats = {"EPUB": 0, "AZW3": 1, "MOBI": 2, "PDF": 3, "CBZ": 4}
+    grouped: dict[int, dict[str, Any]] = {}
+    for row in rows:
+        book_id = int(row["book_id"])
+        group = grouped.setdefault(
+            book_id,
+            {
+                "title": row["title"] or "",
+                "book_dir": row["book_dir"] or "",
+                "authors": [],
+                "formats": [],
+            },
+        )
+        author_name = row["author_name"]
+        if isinstance(author_name, str) and author_name and author_name not in group["authors"]:
+            group["authors"].append(author_name)
+        file_format = row["file_format"]
+        file_stem = row["file_stem"]
+        if isinstance(file_format, str) and isinstance(file_stem, str):
+            group["formats"].append((preferred_formats.get(file_format.upper(), 999), file_stem, file_format))
+
+    by_key: dict[tuple[str, str], list[CalibreBook]] = {}
+    for group in grouped.values():
+        if not group["title"] or not group["authors"] or not group["formats"] or not group["book_dir"]:
+            continue
+        _, file_stem, file_format = min(group["formats"], key=lambda item: item[0])
+        book_path = library_root / group["book_dir"] / f"{file_stem}.{file_format.lower()}"
+        if not book_path.exists():
+            continue
+        book = CalibreBook(
+            title=group["title"],
+            author=" & ".join(group["authors"]),
+            book_path=book_path,
+        )
+        key = (normalize_name(book.title), normalize_name(book.author))
+        by_key.setdefault(key, []).append(book)
+    return by_key
+
+
+def pick_calibre_book(
+    calibre_books: dict[tuple[str, str], list[CalibreBook]],
+    title: str,
+    author: str,
+) -> CalibreBook | None:
+    """Pick one Calibre book candidate for a normalized title/author pair."""
+
+    matches = calibre_books.get((normalize_name(title), normalize_name(author))) or []
+    if len(matches) != 1:
+        return None
+    return matches[0]
 
 
 def choose_winner(args: argparse.Namespace, states: dict[str, Any]) -> str | None:
@@ -1521,6 +1744,34 @@ def create_epw_state_from_foliate(db_path: Path, foliate: FoliateState) -> Updat
     return UpdateResult(changed)
 
 
+def create_epw_state_from_moon(
+    db_path: Path,
+    moon: MoonState,
+    book_path: Path,
+) -> UpdateResult:
+    """Create a missing EPW entry from a Moon+ state and a resolved book path."""
+
+    content_index = choose_epw_content_index_from_moon(moon, str(book_path))
+    if content_index is None:
+        return UpdateResult(
+            False,
+            f"Could not create EPW state for '{moon.title}' because no content index could be derived.",
+        )
+
+    changed = upsert_epw_state(
+        resolve_epw_db_path(db_path),
+        str(book_path),
+        moon.title,
+        moon.author,
+        moon.percent,
+        content_index,
+        80,
+        0,
+        0.0,
+    )
+    return UpdateResult(changed)
+
+
 def create_foliate_state_from_epw(foliate_dir: Path, epw: EPWState) -> UpdateResult:
     """Create a missing Foliate entry from an existing EPW state."""
 
@@ -1575,6 +1826,77 @@ def create_foliate_state_from_epw(foliate_dir: Path, epw: EPWState) -> UpdateRes
         save_foliate_uri_store(foliate_dir, uri_store)
         changed = True
 
+    if save_foliate_cover_cache(foliate_dir, identifier, book_path):
+        changed = True
+
+    return UpdateResult(changed)
+
+
+def create_foliate_state_from_moon(
+    foliate_dir: Path,
+    moon: MoonState,
+    book_path: Path,
+) -> UpdateResult:
+    """Create a missing Foliate entry from a Moon+ state and a resolved book path."""
+
+    try:
+        epub_metadata = read_epub_metadata(book_path)
+        identifier = epub_metadata.get("identifier") or make_foliate_fallback_identifier(book_path)
+    except OSError as exc:
+        return UpdateResult(False, f"Could not create Foliate state for '{moon.title}': {exc}")
+
+    metadata = {
+        "identifier": identifier,
+        "title": epub_metadata.get("title") or moon.title,
+        "author": {"name": epub_metadata.get("author") or moon.author},
+        "modified": iso_utc_now(),
+    }
+    total = 1000
+    current = round(((moon.percent or 0.0) / 100) * total)
+    payload = {
+        "metadata": metadata,
+        "progress": [current, total],
+    }
+
+    synthetic_foliate = FoliateState(
+        path=foliate_dir / f"{identifier}.json",
+        title=metadata["title"],
+        author=metadata["author"]["name"],
+        identifier=identifier,
+        modified_time=time.time(),
+        payload=payload,
+        progress_current=current,
+        progress_total=total,
+        percent=moon.percent,
+    )
+    cfi = synthesize_foliate_location(synthetic_foliate, moon)
+    if cfi:
+        payload["lastLocation"] = cfi
+
+    state_path = foliate_dir / f"{identifier}.json"
+    changed = True
+    if state_path.exists():
+        try:
+            existing = json.loads(state_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            existing = {}
+        changed = existing != payload
+
+    state_path.write_text(
+        json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
+        encoding="utf-8",
+    )
+
+    uri_store = load_foliate_uri_store(foliate_dir)
+    desired_uri = foliate_store_value_for_path(book_path)
+    if uri_store.get(identifier) != desired_uri:
+        uri_store[identifier] = desired_uri
+        save_foliate_uri_store(foliate_dir, uri_store)
+        changed = True
+
+    if save_foliate_cover_cache(foliate_dir, identifier, book_path):
+        changed = True
+
     return UpdateResult(changed)
 
 
@@ -1585,33 +1907,76 @@ def iso_utc_now() -> str:
 
 
 def bootstrap_missing_foliate_epw_entries(
+    args: argparse.Namespace,
+    moon_states: dict[tuple[str, str], MoonState],
     foliate_dir: Path,
-    epw_db_path: Path,
+    epw_db_path: Path | None,
     foliate_by_filepath: dict[str, FoliateState],
     epw_by_filepath: dict[str, EPWState],
+    calibre_books: dict[tuple[str, str], list[CalibreBook]] | None = None,
 ) -> tuple[int, list[str]]:
     """Create missing Foliate/EPW entries when one side already knows the filepath."""
 
     updates = 0
     warnings: list[str] = []
+    created_foliate_paths = set(foliate_by_filepath)
+    created_epw_paths = set(epw_by_filepath)
 
-    for filepath, foliate in foliate_by_filepath.items():
-        if filepath in epw_by_filepath:
-            continue
-        result = create_epw_state_from_foliate(epw_db_path, foliate)
-        if result.changed:
-            updates += 1
-        if result.warning:
-            warnings.append(result.warning)
+    if epw_db_path is not None:
+        for filepath, foliate in foliate_by_filepath.items():
+            if filepath in epw_by_filepath:
+                continue
+            loud_print(args, f"Bootstrap EPW from Foliate: {foliate.title} - {foliate.author}")
+            result = create_epw_state_from_foliate(epw_db_path, foliate)
+            if result.changed:
+                updates += 1
+                loud_print(args, "  created or updated EPW state")
+            if result.warning:
+                warnings.append(result.warning)
 
-    for filepath, epw in epw_by_filepath.items():
-        if filepath in foliate_by_filepath:
+        for filepath, epw in epw_by_filepath.items():
+            if filepath in foliate_by_filepath:
+                continue
+            loud_print(args, f"Bootstrap Foliate from EPW: {epw.title} - {epw.author}")
+            result = create_foliate_state_from_epw(foliate_dir, epw)
+            if result.changed:
+                updates += 1
+                loud_print(args, "  created or updated Foliate state")
+            if result.warning:
+                warnings.append(result.warning)
+
+    calibre_books = calibre_books or {}
+    for key, moon in moon_states.items():
+        calibre_book = pick_calibre_book(calibre_books, moon.title, moon.author)
+        if calibre_book is None:
             continue
-        result = create_foliate_state_from_epw(foliate_dir, epw)
-        if result.changed:
-            updates += 1
-        if result.warning:
-            warnings.append(result.warning)
+
+        filepath_key = canonical_locator(calibre_book.book_path)
+        if filepath_key not in created_foliate_paths:
+            loud_print(
+                args,
+                f"Bootstrap Foliate from Moon+ via Calibre: {moon.title} - {moon.author} -> {calibre_book.book_path}",
+            )
+            result = create_foliate_state_from_moon(foliate_dir, moon, calibre_book.book_path)
+            if result.changed:
+                updates += 1
+                created_foliate_paths.add(filepath_key)
+                loud_print(args, "  created or updated Foliate state")
+            if result.warning:
+                warnings.append(result.warning)
+
+        if epw_db_path is not None and filepath_key not in created_epw_paths:
+            loud_print(
+                args,
+                f"Bootstrap EPW from Moon+ via Calibre: {moon.title} - {moon.author} -> {calibre_book.book_path}",
+            )
+            result = create_epw_state_from_moon(epw_db_path, moon, calibre_book.book_path)
+            if result.changed:
+                updates += 1
+                created_epw_paths.add(filepath_key)
+                loud_print(args, "  created or updated EPW state")
+            if result.warning:
+                warnings.append(result.warning)
 
     return updates, warnings
 
@@ -1639,6 +2004,7 @@ def sync_states(
     moon_dir: Path,
     foliate_dir: Path,
     epw_path: Path | None = None,
+    calibre_db_path: Path | None = None,
 ) -> int:
     """Load, match, resolve, and sync all eligible titles.
 
@@ -1647,30 +2013,51 @@ def sync_states(
     already knows the book.
     """
 
+    loud_print(args, f"Moon+ directory: {moon_dir}")
+    loud_print(args, f"Foliate directory: {foliate_dir}")
+    if epw_path is not None:
+        loud_print(args, f"EPW database: {resolve_epw_db_path(epw_path)}")
+    if calibre_db_path is not None:
+        loud_print(args, f"Calibre DB: {calibre_db_path.expanduser()}")
+
     moon_states = load_moon_states(moon_dir)
     foliate_states = load_foliate_states(foliate_dir)
+    loud_print(args, f"Loaded Moon+ states: {len(moon_states)}")
+    loud_print(args, f"Loaded Foliate states: {len(foliate_states)}")
     updates = 0
     warnings: list[str] = []
+    calibre_books = load_calibre_books(calibre_db_path) if calibre_db_path else {}
+    if calibre_db_path is not None:
+        loud_print(args, f"Loaded Calibre title/author mappings: {len(calibre_books)}")
 
     epw_states: dict[tuple[str, str], EPWState] = {}
+    epw_by_filepath: dict[str, EPWState] = {}
     if epw_path is not None:
         epw_states, epw_by_filepath = load_epw_states(epw_path)
-        foliate_by_filepath = build_foliate_filepath_map(foliate_states)
-        bootstrap_updates, bootstrap_warnings = bootstrap_missing_foliate_epw_entries(
-            foliate_dir,
-            epw_path,
-            foliate_by_filepath,
-            epw_by_filepath,
-        )
-        updates += bootstrap_updates
-        warnings.extend(bootstrap_warnings)
+        loud_print(args, f"Loaded EPW states: {len(epw_states)}")
+    foliate_by_filepath = build_foliate_filepath_map(foliate_states)
+    bootstrap_updates, bootstrap_warnings = bootstrap_missing_foliate_epw_entries(
+        args,
+        moon_states,
+        foliate_dir,
+        epw_path,
+        foliate_by_filepath,
+        epw_by_filepath,
+        calibre_books,
+    )
+    updates += bootstrap_updates
+    warnings.extend(bootstrap_warnings)
 
-        # Reload after bootstrapping so newly created entries can participate in
-        # the normal winner-selection pass.
-        foliate_states = load_foliate_states(foliate_dir)
+    # Reload after bootstrapping so newly created entries can participate in
+    # the normal winner-selection pass.
+    foliate_states = load_foliate_states(foliate_dir)
+    loud_print(args, f"Reloaded Foliate states: {len(foliate_states)}")
+    if epw_path is not None:
         epw_states, _ = load_epw_states(epw_path)
+        loud_print(args, f"Reloaded EPW states: {len(epw_states)}")
 
     all_keys = sorted(set(moon_states) | set(foliate_states) | set(epw_states))
+    loud_print(args, f"Candidate matched keys: {len(all_keys)}")
     for key in all_keys:
         states: dict[str, Any] = {}
         if key in moon_states:
@@ -1680,20 +2067,28 @@ def sync_states(
         if key in epw_states:
             states[APP_EPW] = epw_states[key]
         if len(states) < 2:
+            loud_print(args, f"Skip one-sided entry: {key}")
             continue
 
         winner = choose_winner(args, states)
         if not winner:
+            loud_print(args, f"Skip unresolved entry: {key}")
             continue
+        loud_print(args, f"Winner for {key}: {winner}")
 
         for app_name, state in states.items():
             if app_name == winner:
                 continue
+            loud_print(args, f"  Update {app_name} from {winner}")
             result = update_target_from_source(app_name, state, winner, states[winner])
             if result.changed:
                 updates += 1
+                loud_print(args, "    changed")
+            else:
+                loud_print(args, "    no change")
             if result.warning:
                 warnings.append(result.warning)
+                loud_print(args, f"    warning: {result.warning}")
 
     # Warnings are emitted after the sync loop so normal per-book processing
     # stays simple and the user still sees all issues found during the run.
@@ -1713,15 +2108,25 @@ def main() -> int:
     4. perform sync
     """
 
-    # Keep startup steps in the same order described by the project plan.
+    try:
+        args = parse_args()
+    except ArgumentParseExit as exc:
+        if exc.message:
+            stream = sys.stderr if exc.status else sys.stdout
+            print(exc.message, end="", file=stream)
+        return exc.status
+
+    # Keep startup steps in the same order described by the project plan, while
+    # still allowing `-h/--help` and argument errors to return before bootstrap.
     ensure_venv()
-    args = parse_args()
-    env_directories = load_env_directories(script_root() / ".env")
+    env_directories, calibre_db_path = load_env_directories(script_root() / ".env")
+    loud_print(args, "Loaded configuration from .env")
     updates = sync_states(
         args,
         env_directories[APP_MOON],
         env_directories[APP_FOLIATE],
         env_directories.get(APP_EPW),
+        calibre_db_path,
     )
     print(f"Updated {updates} reading state file(s).")
     return 0
