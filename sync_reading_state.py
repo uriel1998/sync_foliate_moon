@@ -184,12 +184,13 @@ class UpdateResult:
 
     Returning a structured result lets the caller distinguish:
 
-    - "the file changed"
-    - "the file stayed the same"
-    - "the file stayed the same and the user should be told why"
+    - whether the reading position changed
+    - whether any file or database write happened
+    - whether the user should be told about a non-fatal issue
     """
 
     changed: bool
+    wrote: bool = False
     warning: str | None = None
 
 
@@ -666,6 +667,12 @@ def epw_local_book_path(filepath: str) -> Path | None:
     if "://" in filepath:
         return None
     return Path(filepath).expanduser()
+
+
+def epw_points_at_url(filepath: str) -> bool:
+    """Return whether an EPW filepath is actually a URL-like locator."""
+
+    return "://" in filepath
 
 
 def resolve_epw_db_path(path: Path) -> Path:
@@ -1233,12 +1240,12 @@ def build_foliate_filepath_map(states: dict[tuple[str, str], FoliateState]) -> d
 
 def load_epw_states(
     db_path: Path,
-) -> tuple[dict[tuple[str, str], EPWState], dict[str, EPWState]]:
+) -> tuple[dict[tuple[str, str], EPWState], dict[str, EPWState], list[str]]:
     """Load EPW rows and index them by title/author and filepath."""
 
     db_path = resolve_epw_db_path(db_path)
     if not db_path.exists():
-        return {}, {}
+        return {}, {}, []
 
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
@@ -1264,9 +1271,13 @@ def load_epw_states(
 
     by_key: dict[tuple[str, str], EPWState] = {}
     by_filepath: dict[str, EPWState] = {}
+    skipped_urls: list[str] = []
     for row in rows:
         filepath = row["filepath"]
         if not isinstance(filepath, str):
+            continue
+        if epw_points_at_url(filepath):
+            skipped_urls.append(filepath)
             continue
 
         reading_progress = row["reading_progress"]
@@ -1304,7 +1315,7 @@ def load_epw_states(
         if state.title and state.author:
             by_key[(normalize_name(state.title), normalize_name(state.author))] = state
 
-    return by_key, by_filepath
+    return by_key, by_filepath, skipped_urls
 
 
 def load_calibre_books(db_path: Path) -> dict[tuple[str, str], list[CalibreBook]]:
@@ -1437,7 +1448,7 @@ def update_foliate_from_moon(foliate: FoliateState, moon: MoonState) -> bool:
     # progress stays on the same scale the file was already using.
     current = min(total, max(0, round((moon.percent / 100) * total)))
     payload = foliate.payload
-    changed = payload.get("progress") != [current, total]
+    position_changed = payload.get("progress") != [current, total]
     payload["progress"] = [current, total]
 
     # Keep Foliate's own metadata block and only touch the fields needed for
@@ -1445,8 +1456,6 @@ def update_foliate_from_moon(foliate: FoliateState, moon: MoonState) -> bool:
     metadata = payload.setdefault("metadata", {})
     if isinstance(metadata, dict):
         modified = iso_utc_now()
-        if metadata.get("modified") != modified:
-            changed = True
         metadata["modified"] = modified
 
     # Recompute an approximate CFI so reopening in Foliate lands in the right
@@ -1454,14 +1463,14 @@ def update_foliate_from_moon(foliate: FoliateState, moon: MoonState) -> bool:
     synthesized_location = synthesize_foliate_location(foliate, moon)
     if synthesized_location and payload.get("lastLocation") != synthesized_location:
         payload["lastLocation"] = synthesized_location
-        changed = True
+        position_changed = True
 
-    if changed:
+    if position_changed:
         foliate.path.write_text(
             json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
             encoding="utf-8",
         )
-    return changed
+    return position_changed
 
 
 def update_foliate_from_epw(foliate: FoliateState, epw: EPWState) -> bool:
@@ -1473,27 +1482,25 @@ def update_foliate_from_epw(foliate: FoliateState, epw: EPWState) -> bool:
     total = foliate.progress_total or 1000
     current = min(total, max(0, round((epw.percent / 100) * total)))
     payload = foliate.payload
-    changed = payload.get("progress") != [current, total]
+    position_changed = payload.get("progress") != [current, total]
     payload["progress"] = [current, total]
 
     metadata = payload.setdefault("metadata", {})
     if isinstance(metadata, dict):
         modified = iso_utc_now()
-        if metadata.get("modified") != modified:
-            changed = True
         metadata["modified"] = modified
 
     synthesized_location = synthesize_foliate_location_from_epw(foliate, epw)
     if synthesized_location and payload.get("lastLocation") != synthesized_location:
         payload["lastLocation"] = synthesized_location
-        changed = True
+        position_changed = True
 
-    if changed:
+    if position_changed:
         foliate.path.write_text(
             json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
             encoding="utf-8",
         )
-    return changed
+    return position_changed
 
 
 def update_moon_from_foliate(moon: MoonState, foliate: FoliateState) -> UpdateResult:
@@ -1606,8 +1613,11 @@ def upsert_epw_state(
     textwidth: int,
     row: int,
     rel_pctg: float | None,
-) -> bool:
-    """Insert or update an EPW reading state plus its library row."""
+) -> tuple[bool, bool]:
+    """Insert or update an EPW reading state plus its library row.
+
+    Returns `(position_changed, wrote)`.
+    """
 
     init_epw_db(db_path)
     conn = sqlite3.connect(db_path)
@@ -1625,7 +1635,15 @@ def upsert_epw_state(
         ).fetchone()
 
         reading_progress = None if percent is None else percent / 100
-        changed = (
+        position_changed = (
+            existing is None
+            or existing[0] != content_index
+            or existing[1] != textwidth
+            or existing[2] != row
+            or existing[3] != rel_pctg
+            or existing[6] != reading_progress
+        )
+        wrote = (
             existing is None
             or existing[0] != content_index
             or existing[1] != textwidth
@@ -1636,24 +1654,25 @@ def upsert_epw_state(
             or existing[6] != reading_progress
         )
 
-        conn.execute(
-            """
-            INSERT OR REPLACE INTO reading_states
-            (filepath, content_index, textwidth, row, rel_pctg)
-            VALUES (?, ?, ?, ?, ?)
-            """,
-            (filepath, content_index, textwidth, row, rel_pctg),
-        )
-        conn.execute(
-            """
-            INSERT OR REPLACE INTO library
-            (filepath, title, author, reading_progress)
-            VALUES (?, ?, ?, ?)
-            """,
-            (filepath, title, author, reading_progress),
-        )
-        conn.commit()
-        return changed
+        if wrote:
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO reading_states
+                (filepath, content_index, textwidth, row, rel_pctg)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (filepath, content_index, textwidth, row, rel_pctg),
+            )
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO library
+                (filepath, title, author, reading_progress)
+                VALUES (?, ?, ?, ?)
+                """,
+                (filepath, title, author, reading_progress),
+            )
+            conn.commit()
+        return position_changed, wrote
     finally:
         conn.close()
 
@@ -1671,7 +1690,7 @@ def update_epw_from_foliate(epw: EPWState, foliate: FoliateState) -> UpdateResul
             f"Could not approximate Foliate -> EPW for '{epw.title or foliate.title}' because no content index could be derived.",
         )
 
-    changed = upsert_epw_state(
+    changed, wrote = upsert_epw_state(
         epw.db_path,
         epw.filepath,
         epw.title or foliate.title,
@@ -1682,7 +1701,7 @@ def update_epw_from_foliate(epw: EPWState, foliate: FoliateState) -> UpdateResul
         0,
         0.0,
     )
-    return UpdateResult(changed)
+    return UpdateResult(changed, wrote)
 
 
 def update_epw_from_moon(epw: EPWState, moon: MoonState) -> UpdateResult:
@@ -1698,7 +1717,7 @@ def update_epw_from_moon(epw: EPWState, moon: MoonState) -> UpdateResult:
             f"Could not approximate Moon+ -> EPW for '{moon.title}' because no content index could be derived.",
         )
 
-    changed = upsert_epw_state(
+    changed, wrote = upsert_epw_state(
         epw.db_path,
         epw.filepath,
         epw.title or moon.title,
@@ -1709,7 +1728,7 @@ def update_epw_from_moon(epw: EPWState, moon: MoonState) -> UpdateResult:
         0,
         0.0,
     )
-    return UpdateResult(changed)
+    return UpdateResult(changed, wrote)
 
 
 def create_epw_state_from_foliate(db_path: Path, foliate: FoliateState) -> UpdateResult:
@@ -1730,7 +1749,7 @@ def create_epw_state_from_foliate(db_path: Path, foliate: FoliateState) -> Updat
             f"Could not create EPW state for '{foliate.title}' because no content index could be derived.",
         )
 
-    changed = upsert_epw_state(
+    changed, wrote = upsert_epw_state(
         resolve_epw_db_path(db_path),
         str(book_path),
         foliate.title,
@@ -1741,7 +1760,7 @@ def create_epw_state_from_foliate(db_path: Path, foliate: FoliateState) -> Updat
         0,
         0.0,
     )
-    return UpdateResult(changed)
+    return UpdateResult(False, wrote)
 
 
 def create_epw_state_from_moon(
@@ -1758,7 +1777,7 @@ def create_epw_state_from_moon(
             f"Could not create EPW state for '{moon.title}' because no content index could be derived.",
         )
 
-    changed = upsert_epw_state(
+    changed, wrote = upsert_epw_state(
         resolve_epw_db_path(db_path),
         str(book_path),
         moon.title,
@@ -1769,7 +1788,7 @@ def create_epw_state_from_moon(
         0,
         0.0,
     )
-    return UpdateResult(changed)
+    return UpdateResult(False, wrote)
 
 
 def create_foliate_state_from_epw(foliate_dir: Path, epw: EPWState) -> UpdateResult:
@@ -1806,30 +1825,31 @@ def create_foliate_state_from_epw(foliate_dir: Path, epw: EPWState) -> UpdateRes
         payload["lastLocation"] = cfi
 
     state_path = foliate_dir / f"{identifier}.json"
-    changed = True
+    wrote = True
     if state_path.exists():
         try:
             existing = json.loads(state_path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
             existing = {}
-        changed = existing != payload
+        wrote = existing != payload
 
-    state_path.write_text(
-        json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
-        encoding="utf-8",
-    )
+    if wrote:
+        state_path.write_text(
+            json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
+            encoding="utf-8",
+        )
 
     uri_store = load_foliate_uri_store(foliate_dir)
     desired_uri = foliate_store_value_for_path(book_path)
     if uri_store.get(identifier) != desired_uri:
         uri_store[identifier] = desired_uri
         save_foliate_uri_store(foliate_dir, uri_store)
-        changed = True
+        wrote = True
 
     if save_foliate_cover_cache(foliate_dir, identifier, book_path):
-        changed = True
+        wrote = True
 
-    return UpdateResult(changed)
+    return UpdateResult(False, wrote)
 
 
 def create_foliate_state_from_moon(
@@ -1874,30 +1894,31 @@ def create_foliate_state_from_moon(
         payload["lastLocation"] = cfi
 
     state_path = foliate_dir / f"{identifier}.json"
-    changed = True
+    wrote = True
     if state_path.exists():
         try:
             existing = json.loads(state_path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
             existing = {}
-        changed = existing != payload
+        wrote = existing != payload
 
-    state_path.write_text(
-        json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
-        encoding="utf-8",
-    )
+    if wrote:
+        state_path.write_text(
+            json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
+            encoding="utf-8",
+        )
 
     uri_store = load_foliate_uri_store(foliate_dir)
     desired_uri = foliate_store_value_for_path(book_path)
     if uri_store.get(identifier) != desired_uri:
         uri_store[identifier] = desired_uri
         save_foliate_uri_store(foliate_dir, uri_store)
-        changed = True
+        wrote = True
 
     if save_foliate_cover_cache(foliate_dir, identifier, book_path):
-        changed = True
+        wrote = True
 
-    return UpdateResult(changed)
+    return UpdateResult(False, wrote)
 
 
 def iso_utc_now() -> str:
@@ -1928,8 +1949,7 @@ def bootstrap_missing_foliate_epw_entries(
                 continue
             loud_print(args, f"Bootstrap EPW from Foliate: {foliate.title} - {foliate.author}")
             result = create_epw_state_from_foliate(epw_db_path, foliate)
-            if result.changed:
-                updates += 1
+            if result.wrote:
                 loud_print(args, "  created or updated EPW state")
             if result.warning:
                 warnings.append(result.warning)
@@ -1939,8 +1959,7 @@ def bootstrap_missing_foliate_epw_entries(
                 continue
             loud_print(args, f"Bootstrap Foliate from EPW: {epw.title} - {epw.author}")
             result = create_foliate_state_from_epw(foliate_dir, epw)
-            if result.changed:
-                updates += 1
+            if result.wrote:
                 loud_print(args, "  created or updated Foliate state")
             if result.warning:
                 warnings.append(result.warning)
@@ -1958,8 +1977,7 @@ def bootstrap_missing_foliate_epw_entries(
                 f"Bootstrap Foliate from Moon+ via Calibre: {moon.title} - {moon.author} -> {calibre_book.book_path}",
             )
             result = create_foliate_state_from_moon(foliate_dir, moon, calibre_book.book_path)
-            if result.changed:
-                updates += 1
+            if result.wrote:
                 created_foliate_paths.add(filepath_key)
                 loud_print(args, "  created or updated Foliate state")
             if result.warning:
@@ -1971,8 +1989,7 @@ def bootstrap_missing_foliate_epw_entries(
                 f"Bootstrap EPW from Moon+ via Calibre: {moon.title} - {moon.author} -> {calibre_book.book_path}",
             )
             result = create_epw_state_from_moon(epw_db_path, moon, calibre_book.book_path)
-            if result.changed:
-                updates += 1
+            if result.wrote:
                 created_epw_paths.add(filepath_key)
                 loud_print(args, "  created or updated EPW state")
             if result.warning:
@@ -2025,7 +2042,6 @@ def sync_states(
     loud_print(args, f"Loaded Moon+ states: {len(moon_states)}")
     loud_print(args, f"Loaded Foliate states: {len(foliate_states)}")
     updates = 0
-    warnings: list[str] = []
     calibre_books = load_calibre_books(calibre_db_path) if calibre_db_path else {}
     if calibre_db_path is not None:
         loud_print(args, f"Loaded Calibre title/author mappings: {len(calibre_books)}")
@@ -2033,8 +2049,11 @@ def sync_states(
     epw_states: dict[tuple[str, str], EPWState] = {}
     epw_by_filepath: dict[str, EPWState] = {}
     if epw_path is not None:
-        epw_states, epw_by_filepath = load_epw_states(epw_path)
+        epw_states, epw_by_filepath, skipped_epw_urls = load_epw_states(epw_path)
         loud_print(args, f"Loaded EPW states: {len(epw_states)}")
+        for filepath in skipped_epw_urls:
+            warning = f"Skipping EPW URL entry because it does not point at a local file: {filepath}"
+            loud_print(args, warning)
     foliate_by_filepath = build_foliate_filepath_map(foliate_states)
     bootstrap_updates, bootstrap_warnings = bootstrap_missing_foliate_epw_entries(
         args,
@@ -2046,14 +2065,15 @@ def sync_states(
         calibre_books,
     )
     updates += bootstrap_updates
-    warnings.extend(bootstrap_warnings)
+    for warning in bootstrap_warnings:
+        loud_print(args, f"warning: {warning}")
 
     # Reload after bootstrapping so newly created entries can participate in
     # the normal winner-selection pass.
     foliate_states = load_foliate_states(foliate_dir)
     loud_print(args, f"Reloaded Foliate states: {len(foliate_states)}")
     if epw_path is not None:
-        epw_states, _ = load_epw_states(epw_path)
+        epw_states, _, _ = load_epw_states(epw_path)
         loud_print(args, f"Reloaded EPW states: {len(epw_states)}")
 
     all_keys = sorted(set(moon_states) | set(foliate_states) | set(epw_states))
@@ -2084,16 +2104,12 @@ def sync_states(
             if result.changed:
                 updates += 1
                 loud_print(args, "    changed")
+            elif result.wrote:
+                loud_print(args, "    wrote metadata or cache only")
             else:
                 loud_print(args, "    no change")
             if result.warning:
-                warnings.append(result.warning)
                 loud_print(args, f"    warning: {result.warning}")
-
-    # Warnings are emitted after the sync loop so normal per-book processing
-    # stays simple and the user still sees all issues found during the run.
-    for warning in warnings:
-        print(f"WARNING: {warning}", file=sys.stderr)
 
     return updates
 
