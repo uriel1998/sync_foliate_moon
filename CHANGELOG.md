@@ -1,5 +1,15 @@
 # Changelog
 
+## v.0.9.12 - 2026-09-27
+
+- match article-sorted titles, omitted apostrophes, and equivalent Unicode spellings
+- recognize shared local book paths despite different reader metadata
+- match reordered or strongly agreeing shortened anthology contributor lists, rejecting ambiguous candidates
+- resolve local file URLs and parse Moon+ titles containing ` - ` or uppercase file extensions
+- use unique Calibre matches to connect Moon+ entries with differing contributor metadata
+- remember entries created during bootstrap so the Calibre pass does not recreate them in the same run
+- document matching rules, local file URL support, and skipped-entry diagnostics
+
 ## v.0.9.11
 
 - document that EPW entries pointing at URLs are skipped

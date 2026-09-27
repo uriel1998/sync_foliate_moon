@@ -33,7 +33,7 @@ Note:  While I use Calibre for library management, I have Foliate configured as 
 - Creates and uses a local virtual environment
 - Installs dependencies from `requirements.txt`
 - Reads Moon+, Foliate, optional EPW locations, and optional `Calibre_DB` from its local config file
-- Matches books by normalized `title + author`
+- Matches books by shared local paths or unambiguous title/contributor metadata
 - Supports conflict resolution with `--position`, `--date`, `--moon`, `--foliate`, and `--epw`
 - Supports `--loud` for noisy step-by-step progress output
 - Updates Foliate progress and approximate reopen position
@@ -41,7 +41,7 @@ Note:  While I use Calibre for library management, I have Foliate configured as 
 - Updates EPW SQLite reading state directly
 - Attempts approximate Foliate -> Moon+ compact sync using the actual EPUB spine
 - Bootstraps missing Foliate/EPW entries when one side already knows the book filepath
-- Skips EPW entries whose `filepath` is actually a URL rather than a local file
+- Skips epw entries pointing at remote URLs; accepts local paths and local file URLs
 - Populates Foliate's cached cover image when a Calibre cover or EPUB cover can be resolved during Foliate entry creation
 - Counts only actual reading-position changes in the final `Updated N reading state file(s).` summary
 
@@ -183,7 +183,8 @@ so they can match Moon+ filenames using the same convention.
 
 ### 5. Match Books
 
-The script matches books by normalized `(title, author)` pairs.
+The script groups books by shared local paths first, then by unambiguous
+normalized title and contributor metadata.
 
 Normalization intentionally ignores formatting details:
 
@@ -192,9 +193,28 @@ Normalization intentionally ignores formatting details:
 - underscores become spaces
 - repeated whitespace is collapsed
 
+Title matching also recognizes English article-sorted names: `Butcher's
+Masquerade, The` matches `The Butcher's Masquerade` (likewise for `A` and `An`).
+Articles are retained. Apostrophes inside words are ignored (`Zoes Tale` matches
+`Zoe's Tale`), and equivalent Unicode spellings are normalized.
+
+Foliate and epw entries pointing to the same local book file are grouped even
+when their title or contributor metadata differs. Local `file:` URLs are decoded
+before comparing paths. A unique Calibre match can supply the same identity for
+Moon+.
+
+Without a shared path, titles must match. Contributor lists may be reordered;
+shortened anthology lists must have at least three distinct names, matching first
+and last contributors, and at least 80% of the shorter list in common. Ambiguous
+matches involving multiple entries from one reader are kept separate, with a
+warning under `--loud`. Calibre lookups also require a unique candidate.
+
 This is a lossy comparison by design. The goal is resilience across metadata sources, not preservation of display formatting.
 
-Moon+ still matches by normalized title/author.
+Moon+ filenames supply the title and contributors used for matching.
+The final ` - ` separates the title from the author, so titles can contain
+earlier separators. State-file suffixes and ebook extensions are recognized
+regardless of case.
 
 Foliate and EPW can also bootstrap one-sided entries when one side already
 knows the real book filepath. That lets them sync even if the book has not yet
@@ -297,8 +317,9 @@ The resulting compact state is intentionally boundary-based. It resets page and 
 When Foliate and EPW both know the same book filepath, the script can sync them
 even if one side did not previously have a saved reading-state entry.
 
-EPW entries that point at URLs instead of local files are skipped, because the
-current sync logic needs direct filesystem access to the book.
+epw entries pointing at remote URLs are skipped because synchronization needs
+direct filesystem access. Local `file:` URLs are supported, including escaped
+spaces and punctuation; their host must be empty or `localhost`.
 
 Foliate -> EPW:
 
@@ -379,9 +400,10 @@ It does not count:
 
 ### Some One-Sided Books Are Still Skipped
 
-Moon+ entries present only on one side are still ignored.
+Moon+ entries without a reader counterpart or a unique Calibre match are skipped.
 
-Foliate and EPW can create missing counterpart entries when filepath information is available, but Moon+ does not expose a comparable stable filepath-based identity.
+Foliate and epw can create missing counterpart entries when filepath information
+is available. A unique Calibre match can provide a path for Moon+ as well.
 
 ### Unparseable Entries Are Skipped
 
@@ -391,11 +413,25 @@ The script skips:
 - Foliate JSON files without usable title metadata
 - entries with insufficient progress data for the chosen conflict mode
 
+## Troubleshooting Matches
+
+Run with `--loud` to see book groups, selected readers, update attempts, and
+warnings. This performs a normal sync; it is not a preview mode.
+
+- `Skip one-sided entry` means only one reader has a state in that group after bootstrap.
+- `Skip unresolved entry` means no winner could be selected, for example because progress is missing in the default mode.
+- `Ambiguous book match` means multiple entries from one reader could belong to the same group, so the proposed groups were kept separate.
+
+Check titles, contributor lists, and the backing book paths when an entry remains
+unmatched. Similar titles alone are not enough to establish a match, and article
+handling currently covers English `The`, `A`, and `An` only.
+
 ## Files
 
 - [`sync_reading_state.py`](./sync_reading_state.py): main script
 - [`requirements.txt`](./requirements.txt): Python dependencies
 - [`env.example`](./env.example): example configuration
+- [`CHANGELOG.md`](./CHANGELOG.md): release history
 
 ## License
 

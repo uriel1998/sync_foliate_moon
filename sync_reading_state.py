@@ -20,8 +20,8 @@ material in this repository.
 
 The script therefore follows a conservative strategy:
 
-1. Match books only when both title and author can be normalized to the same
-   logical key.
+1. Match books by shared local paths or unambiguous normalized title and
+   contributor metadata.
 2. Use percentage progress as the common comparison metric.
 3. Preserve each application's native file format where possible.
 4. Use section-level approximations only when exact conversion is impossible.
@@ -43,11 +43,14 @@ import sqlite3
 import subprocess
 import sys
 import time
+import unicodedata
 import venv
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
+from urllib.request import url2pathname
 from zipfile import ZipFile
 
 
@@ -62,7 +65,7 @@ COMPACT_MOON_RE = re.compile(
     r"(?:@(?P<page>\d+))?(?:#(?P<offset>\d+))?:"
     r"(?P<percent>\d+(?:\.\d+)?)%$"
 )
-TITLE_AUTHOR_RE = re.compile(r"^(?P<title>.+?) - (?P<author>.+)$")
+TITLE_AUTHOR_RE = re.compile(r"^(?P<title>.+) - (?P<author>.+)$")
 
 
 def script_root() -> Path:
@@ -377,9 +380,39 @@ def normalize_name(value: str) -> str:
     # Matching by exact raw strings would fail too often across ebook sources.
     # This normalization is intentionally lossy: it sacrifices formatting
     # details in exchange for more stable title/author keys.
-    lowered = value.casefold().replace("_", " ")
+    lowered = unicodedata.normalize("NFKC", value).casefold().replace("_", " ")
+    lowered = re.sub(r"(?<=\w)['\u2019\u02bc](?=\w)", "", lowered)
     lowered = re.sub(r"[^\w]+", " ", lowered)
     return " ".join(lowered.split())
+
+
+def normalize_title(value: str) -> str:
+    """Match display titles to English article-sorted titles without dropping articles."""
+
+    sorted_title = re.fullmatch(r"(.+),\s*(the|an|a)\s*", value.strip(), re.IGNORECASE)
+    if sorted_title:
+        value = f"{sorted_title.group(2)} {sorted_title.group(1)}"
+    return normalize_name(value)
+
+
+def authors_match(left: str, right: str) -> bool:
+    """Accept reordered contributors or strongly agreeing shortened anthology lists."""
+
+    if normalize_name(left) == normalize_name(right):
+        return bool(normalize_name(left))
+    left_names = [normalize_name(name) for name in left.split("&") if name.strip()]
+    right_names = [normalize_name(name) for name in right.split("&") if name.strip()]
+    left_set, right_set = set(left_names), set(right_names)
+    if left_set == right_set:
+        return bool(left_set)
+    shorter_count = min(len(left_set), len(right_set))
+    # Moon+ export filenames can omit the middle of a long contributor list.
+    return (
+        shorter_count >= 3
+        and left_names[0] == right_names[0]
+        and left_names[-1] == right_names[-1]
+        and len(left_set & right_set) / shorter_count >= 0.8
+    )
 
 
 def parse_title_author_from_filename(path: Path) -> tuple[str, str] | None:
@@ -394,12 +427,12 @@ def parse_title_author_from_filename(path: Path) -> tuple[str, str] | None:
     # truth for title and author on that side.
     name = path.name
     for suffix in (".po", ".an"):
-        if name.endswith(suffix):
+        if name.lower().endswith(suffix):
             name = name[: -len(suffix)]
     for ext in (".epub", ".pdf", ".md", ".txt", ".mobi", ".azw3", ".cbz"):
-        if name.endswith(ext):
+        if name.lower().endswith(ext):
             name = name[: -len(ext)]
-    # The split is intentionally greedy toward the author side so that titles
+    # The split is intentionally greedy toward the title side so that titles
     # containing hyphens still work as long as the final separator is ` - `.
     match = TITLE_AUTHOR_RE.match(name)
     if not match:
@@ -663,26 +696,33 @@ def normalize_foliate_author(value: Any) -> str:
 def canonical_locator(value: str | Path) -> str:
     """Return a stable comparable locator for local paths or URIs."""
 
-    text = str(value)
-    if text.startswith("file://"):
-        return Path(text.removeprefix("file://")).expanduser().resolve(strict=False).as_posix()
-    if "://" in text:
-        return text
-    return Path(text).expanduser().resolve(strict=False).as_posix()
+    path = local_book_path(str(value))
+    return path.resolve(strict=False).as_posix() if path is not None else str(value)
+
+
+def local_book_path(locator: str) -> Path | None:
+    """Decode local file URIs, preserving literal percent signs in plain paths."""
+
+    if locator.lower().startswith("file:"):
+        uri = urlsplit(locator)
+        if uri.netloc.casefold() not in ("", "localhost") or uri.query or uri.fragment:
+            return None
+        return Path(url2pathname(uri.path)).expanduser()
+    if "://" in locator:
+        return None
+    return Path(locator).expanduser()
 
 
 def epw_local_book_path(filepath: str) -> Path | None:
     """Return a local book path for an EPW filepath when one exists."""
 
-    if "://" in filepath:
-        return None
-    return Path(filepath).expanduser()
+    return local_book_path(filepath)
 
 
 def epw_points_at_url(filepath: str) -> bool:
-    """Return whether an EPW filepath is actually a URL-like locator."""
+    """Return whether an EPW locator cannot be used as a local file path."""
 
-    return "://" in filepath
+    return local_book_path(filepath) is None
 
 
 def resolve_epw_db_path(path: Path) -> Path:
@@ -788,9 +828,11 @@ def foliate_cache_dir(foliate_dir: Path) -> Path:
 def foliate_store_value_for_path(book_path: Path) -> str:
     """Format a local path the way Foliate stores it in `uri-store.json`."""
 
-    home_dir = str(Path.home())
-    resolved = str(book_path.expanduser())
-    return resolved.replace(home_dir, "~", 1) if resolved.startswith(home_dir) else f"file://{resolved}"
+    resolved = book_path.expanduser().resolve(strict=False)
+    try:
+        return str(Path("~") / resolved.relative_to(Path.home()))
+    except ValueError:
+        return resolved.as_uri()
 
 
 def get_foliate_book_locator(foliate: FoliateState) -> str | None:
@@ -815,10 +857,10 @@ def resolve_foliate_book_path(foliate: FoliateState) -> Path | None:
     """
 
     locator = get_foliate_book_locator(foliate)
-    if not locator or "://" in locator:
+    if not locator:
         return None
-    candidate = Path(locator).expanduser()
-    return candidate if candidate.exists() else None
+    candidate = local_book_path(locator)
+    return candidate if candidate is not None and candidate.exists() else None
 
 
 def read_epub_spine_items(book_path: Path) -> list[str] | None:
@@ -1211,11 +1253,11 @@ def load_moon_states(directory: Path) -> dict[tuple[str, str], MoonState]:
     """
 
     states: dict[tuple[str, str], MoonState] = {}
-    for path in sorted(directory.glob("*.po")):
+    for path in sorted(path for path in directory.glob("*") if path.suffix.lower() == ".po"):
         state = parse_moon_state(path)
         if not state:
             continue
-        key = (normalize_name(state.title), normalize_name(state.author))
+        key = (normalize_title(state.title), normalize_name(state.author))
         states[key] = state
     return states
 
@@ -1232,7 +1274,7 @@ def load_foliate_states(directory: Path) -> dict[tuple[str, str], FoliateState]:
         state = parse_foliate_state(path)
         if not state:
             continue
-        key = (normalize_name(state.title), normalize_name(state.author))
+        key = (normalize_title(state.title), normalize_name(state.author))
         states[key] = state
     return states
 
@@ -1323,7 +1365,7 @@ def load_epw_states(
 
         by_filepath[canonical_locator(filepath)] = state
         if state.title and state.author:
-            by_key[(normalize_name(state.title), normalize_name(state.author))] = state
+            by_key[(normalize_title(state.title), normalize_name(state.author))] = state
 
     return by_key, by_filepath, skipped_urls
 
@@ -1393,7 +1435,7 @@ def load_calibre_books(db_path: Path) -> dict[tuple[str, str], list[CalibreBook]
             author=" & ".join(group["authors"]),
             book_path=book_path,
         )
-        key = (normalize_name(book.title), normalize_name(book.author))
+        key = (normalize_title(book.title), normalize_name(book.author))
         by_key.setdefault(key, []).append(book)
     return by_key
 
@@ -1403,12 +1445,84 @@ def pick_calibre_book(
     title: str,
     author: str,
 ) -> CalibreBook | None:
-    """Pick one Calibre book candidate for a normalized title/author pair."""
+    """Pick a unique Calibre match, allowing strongly agreeing contributor lists."""
 
-    matches = calibre_books.get((normalize_name(title), normalize_name(author))) or []
-    if len(matches) != 1:
-        return None
-    return matches[0]
+    matches = calibre_books.get((normalize_title(title), normalize_name(author))) or []
+    if matches:
+        return matches[0] if len(matches) == 1 else None
+    title_key = normalize_title(title)
+    matches = [
+        book
+        for (candidate_title, _), books in calibre_books.items()
+        if candidate_title == title_key
+        for book in books
+        if authors_match(author, book.author)
+    ]
+    return matches[0] if len(matches) == 1 else None
+
+
+def group_reader_states(
+    moon_states: dict[tuple[str, str], MoonState],
+    foliate_states: dict[tuple[str, str], FoliateState],
+    epw_states: dict[tuple[str, str], EPWState],
+    calibre_books: dict[tuple[str, str], list[CalibreBook]],
+    args: argparse.Namespace | None = None,
+) -> list[dict[str, Any]]:
+    """Group shared paths first, then unambiguous title/contributor matches."""
+
+    records: list[tuple[str, Any, str | None]] = []
+    for app, states in ((APP_MOON, moon_states), (APP_FOLIATE, foliate_states), (APP_EPW, epw_states)):
+        for state in states.values():
+            locator = None
+            if app == APP_MOON:
+                book = pick_calibre_book(calibre_books, state.title, state.author)
+                locator = book.book_path if book else None
+            elif app == APP_FOLIATE:
+                locator = get_foliate_book_locator(state)
+            else:
+                locator = state.filepath
+            path = local_book_path(str(locator)) if locator else None
+            records.append((app, state, canonical_locator(path) if path is not None else None))
+
+    groups = [[record] for record in records]
+    for by_path in (True, False):
+        neighbors = [set() for _ in groups]
+        for i, left in enumerate(groups):
+            for j in range(i + 1, len(groups)):
+                right = groups[j]
+                matched = any(
+                    app_a != app_b and (
+                        path_a is not None and path_a == path_b if by_path else
+                        normalize_title(a.title) == normalize_title(b.title)
+                        and authors_match(a.author, b.author)
+                    )
+                    for app_a, a, path_a in left
+                    for app_b, b, path_b in right
+                )
+                if matched:
+                    neighbors[i].add(j)
+                    neighbors[j].add(i)
+        merged = []
+        visited: set[int] = set()
+        for i in range(len(groups)):
+            if i in visited:
+                continue
+            pending, component = [i], set()
+            while pending:
+                index = pending.pop()
+                if index in component:
+                    continue
+                component.add(index)
+                pending.extend(neighbors[index] - component)
+            visited.update(component)
+            records = [record for index in sorted(component) for record in groups[index]]
+            if len({app for app, _, _ in records}) == len(records):
+                merged.append(records)
+            else:
+                loud_print(args, f"warning: Ambiguous book match; keeping entries separate: {records[0][1].title}")
+                merged.extend(groups[index] for index in sorted(component))
+        groups = merged
+    return [{app: state for app, state, _ in group} for group in groups]
 
 
 def choose_winner(args: argparse.Namespace, states: dict[str, Any]) -> str | None:
@@ -1960,6 +2074,7 @@ def bootstrap_missing_foliate_epw_entries(
             loud_print(args, f"Bootstrap EPW from Foliate: {foliate.title} - {foliate.author}")
             result = create_epw_state_from_foliate(epw_db_path, foliate)
             if result.wrote:
+                created_epw_paths.add(filepath)
                 loud_print(args, "  created or updated EPW state")
             if result.warning:
                 warnings.append(result.warning)
@@ -1970,6 +2085,7 @@ def bootstrap_missing_foliate_epw_entries(
             loud_print(args, f"Bootstrap Foliate from EPW: {epw.title} - {epw.author}")
             result = create_foliate_state_from_epw(foliate_dir, epw)
             if result.wrote:
+                created_foliate_paths.add(filepath)
                 loud_print(args, "  created or updated Foliate state")
             if result.warning:
                 warnings.append(result.warning)
@@ -2035,7 +2151,7 @@ def sync_states(
 ) -> int:
     """Load, match, resolve, and sync all eligible titles.
 
-    Books are matched by normalized title/author across the configured apps.
+    Books are grouped by shared paths or unambiguous title/contributor matches.
     Foliate and EPW also bootstrap missing entries from filepath when one side
     already knows the book.
     """
@@ -2086,16 +2202,11 @@ def sync_states(
         epw_states, _, _ = load_epw_states(epw_path)
         loud_print(args, f"Reloaded EPW states: {len(epw_states)}")
 
-    all_keys = sorted(set(moon_states) | set(foliate_states) | set(epw_states))
-    loud_print(args, f"Candidate matched keys: {len(all_keys)}")
-    for key in all_keys:
-        states: dict[str, Any] = {}
-        if key in moon_states:
-            states[APP_MOON] = moon_states[key]
-        if key in foliate_states:
-            states[APP_FOLIATE] = foliate_states[key]
-        if key in epw_states:
-            states[APP_EPW] = epw_states[key]
+    groups = group_reader_states(moon_states, foliate_states, epw_states, calibre_books, args)
+    loud_print(args, f"Candidate book groups: {len(groups)}")
+    for states in groups:
+        representative = next(iter(states.values()))
+        key = (normalize_title(representative.title), normalize_name(representative.author))
         if len(states) < 2:
             loud_print(args, f"Skip one-sided entry: {key}")
             continue
